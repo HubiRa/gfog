@@ -7,9 +7,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Union
 
-# type defs
-rankT = int
-
 
 @dataclass
 class BufferBase(ABC):
@@ -124,7 +121,7 @@ class TensorBuffer(BufferBase):
     '''
     buffer_size: int
     buffer_dim: int 
-    buffer_index: List[rankT] = field(default_factory=list)
+    buffer_index: List[int] = field(default_factory=list)
     values: torch.Tensor = field(default=None)
     buffer: torch.Tensor = field(default=None)
 
