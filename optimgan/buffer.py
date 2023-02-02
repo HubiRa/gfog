@@ -274,93 +274,9 @@ class TensorBuffer(BufferBase):
         assert k > 0 and k <= len(self.buffer_index)
         return self.get(self.buffer_index[-k:])
 
-@dataclass
-class TensorBufferSimple(TensorBufferBase):
-    '''
-    Simple buffer class that stores data in a tensor instead of a list
-    :data: output of generator, stored in buffer
-    '''
-    buffer: torch.Tensor = field(default=None)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.buffer = torch.empty(self.buffer_size, self.buffer_dim) if self.buffer is None else self.buffer
-        assert self.buffer.shape == (self.buffer_size, self.buffer_dim)
-
-        # initial sorting
-        # TODO: think about this!!
-        self.sort()
-
-    def get(self, index: Union[List[int], int]) -> torch.Tensor:
-        if isinstance(index, list):
-            return self.buffer[index]
-        else:
-            return self.buffer[index]
-
-    def sort(self) -> None:
-        super().sort()
-        self.buffer = self.buffer[self.buffer_index]
-    
-    def insert(self, values: Union[np.array, torch.Tensor], data: torch.tensor) -> None:
-        """
-        assumes self.buffer_index is sorted from smallest value to largest value
-        assumes self.buffer is stored in the same order as self.values
-        """
-        # index maps from value to index in data
-        # the index is sorted from smallest to largest value
-        # e.g. [3,2,0,1] means that the value at index 3 is the smalles one etc
-        # and the corresponding data is at index 0
-        # At the beginning, the index is just the identity, since we sort the values
-        # and the data is sorted in the same way
-        #
-        # Since the buffer size stays the same, we have to remove the largest value
-        # First we check if the new value is smaller than the largest value
-
-        # get largest value
-        largest_value = self.values[-len(values):]
-
-        # concat new values to largest values
-        val = torch.cat((largest_value, values))
-
-        # argsort concated values
-        idx_new = torch.argsort(val)
-
-        # are the values new or old? TODO: check if >= is correct
-        new = idx_new[:len(values)] >= len(values)
-
-        # we now know which of the new values should be inserted
-        # if no new value should be inserted, we are done, else we need to insert some values
-        if any(new):
-            # there are new values to be inserted
-            # get the indices of the values that should be inserted
-            insert_idx = idx_new[:len(values)][new] - len(values)
-
-            # get values
-            new_values = values[insert_idx]
-
-            # get the indices of the values that should be removed
-            remove = idx_new[-len(values):] < len(values)
-            remove_idx = idx_new[-len(values):][remove]
-            
-            # len of remove_idx should be equal to len(new_values)
-            assert len(remove_idx) == len(new_values)
-
-            # replace tensors in data
-            self.buffer[remove_idx] = data[new_values]
-
-            # replace values
-            self.values[remove_idx] = new_values
-
-            # argsort holds mapping from value to index in data
-            self.buffer_index = torch.argsort(self.values)
-
-            # sort values
-            self.values = self.values[self.buffer_index]    
-
-
 
 if __name__ == '__main__':
-    sbuff = TensorBufferSimple(
+    sbuff = TensorBuffer(
         buffer_size=10, 
         buffer_dim=2
     )
