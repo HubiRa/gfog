@@ -19,6 +19,10 @@ class BufferBase(ABC):
         pass
 
     @abstractmethod
+    def insert_many(self, tensors: List[torch.Tensor], values: List[float]) -> None:
+        pass
+
+    @abstractmethod
     def sort(self) -> None:
         pass
 
@@ -60,6 +64,9 @@ class BufferBase(ABC):
 
 
 class Buffer(BufferBase):
+    '''
+    Simple buffer that stores tensors sorted w.r.t. values
+    '''
     buffer_size: int
     buffer_dim: int
     buffer: List[torch.Tensor] = field(default_factory=list)
@@ -96,8 +103,17 @@ class Buffer(BufferBase):
         self.values.insert(idx, value)
         self.buffer.insert(idx, tensor)
 
-    def insert_many(self, tensors: List[torch.Tensor], values: List[float]) -> None:
+    def insert_many(self, tensors: List[torch.Tensor], values: List[float], presort: bool=False) -> None:
+        '''
+        presort: if True, tensors and values are sorted before insertion to avoid unnecessary inserts
+        TODO: check if presort is necessary in terms of efficiency
+        '''
+        tensors, values = zip(*sorted(zip(tensors, values)))
         for tensor, value in zip(tensors, values):
+            if value > self.values[-1]:
+                # we are done if one value is greater than the
+                # greatest value in the buffer
+                break
             self.insert(tensor, value)
 
     def get(self, idx: Union[int, slice]) -> torch.Tensor:
@@ -108,10 +124,40 @@ class Buffer(BufferBase):
 
     def get_bottom_k(self, k: int) -> torch.Tensor:
         return torch.Tensor(self.get(slice(-k, None)))
+    
+    def get_top_p(self, p: float) -> torch.Tensor:
+        return torch.Tensor(self.get(slice(int(p * self.buffer_size))))
+
+    def get_bottom_p(self, p: float) -> torch.Tensor:
+        return torch.Tensor(self.get(slice(-int(p * self.buffer_size), None)))
+
+    def get_random_batch(self, batch_size: int) -> torch.Tensor:
+        return torch.Tensor(sample(self.buffer, batch_size))
+
+    def get_random_batch_from_top_p(self, p: float, batch_size: int) -> torch.Tensor:
+        top_p = self.get_top_p(p)
+        assert len(top_p) >= batch_size
+        return torch.Tensor(sample(top_p, batch_size))
+
+    def get_random_batch_from_top_k(self, k: int, batch_size: int) -> torch.Tensor:
+        top_k = self.get_top_k(k)
+        assert len(top_k) >= batch_size
+        return torch.Tensor(sample(top_k, batch_size))
+
+    def get_random_batch_from_bottom_p(self, p: float, batch_size: int) -> torch.Tensor:
+        bottom_p = self.get_bottom_p(p)
+        assert len(bottom_p) >= batch_size
+        return torch.Tensor(sample(bottom_p, batch_size))
+
+    def get_random_batch_from_bottom_k(self, k: int, batch_size: int) -> torch.Tensor:
+        bottom_k = self.get_bottom_k(k)
+        assert len(bottom_k) >= batch_size
+        return torch.Tensor(sample(bottom_k, batch_size))
 
 @dataclass
 class TensorBuffer(BufferBase):
     '''
+    TODO. This is WIP
     Base class for buffers
     :buffer_size: size of buffer
     :buffer_dim: dimension of buffer
@@ -276,15 +322,15 @@ class TensorBuffer(BufferBase):
 
 
 if __name__ == '__main__':
-    sbuff = TensorBuffer(
+    buffer = Buffer(
         buffer_size=10, 
         buffer_dim=2
     )
     #sbuff.insert([0.4, 0.2, 0.1], torch.tensor([[1, 2], [3, 4], [5, 6]]))
-    print(sbuff.data_index)
-    print(sbuff.values)
-    print(sbuff.get([0,1,2]))
-    data = torch.ones(4,2)*torch.tensor([1,3,0,4]).view(-1,1)
-    sbuff.insert(torch.Tensor([1, 3, 0, 4]), data)
-    print(sbuff.get_top_k(k=2))
+    print(buffer.data_index)
+    print(buffer.values)
+    print(buffer.get([0,1,2]))
+    data = list(torch.ones(4,2)*torch.tensor([1,3,0,4]).view(-1,1))
+    buffer.insert([1, 3, 0, 4], data)
+    print(buffer.get_top_k(k=2))
     
