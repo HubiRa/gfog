@@ -136,15 +136,4 @@ class SimpleOptimGan(OptimGan):
         self.buffer.insert_many(list(values), list(x))
         
 
-
-
-        for _ in range(100):
-            optimizer.zero_grad()
-            x = self.generator(x)
-            x = self.f(x)
-            x.backward()
-            optimizer.step()
-        return x.detach().to(self.f_device)
-
-
     
