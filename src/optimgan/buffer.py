@@ -12,6 +12,7 @@ from typing import Dict, List, Union
 class BufferBase(ABC):
     buffer_size: int
     buffer_dim: int
+    buffer_device: torch.device
 
     def __post_init__(self) -> None:
         pass
@@ -79,6 +80,7 @@ class Buffer(BufferBase):
     def __post_init__(self) -> None:
         assert self.buffer_size > 0        
         assert self.buffer_dim > 0
+        assert self.buffer_device is not None
 
         if self.values is None:
             self.values = [np.inf] * self.buffer_size
@@ -162,6 +164,16 @@ class Buffer(BufferBase):
         bottom_k = self.get_bottom_k(k)
         assert len(bottom_k) >= batch_size
         return sample(bottom_k, batch_size)
+
+
+@dataclass
+class HirachicalBuffer(Buffer):
+    '''
+    BUFFER with hirachical value structure
+    This is e.g. to account for constarints on the domain
+    '''
+    pass
+
 
 @dataclass
 class TensorBuffer(BufferBase):
