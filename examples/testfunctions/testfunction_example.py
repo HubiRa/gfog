@@ -1,6 +1,7 @@
 import torch
-from optimgan._torch.optimgan import SimpleOptimGan, RandomOpt
-from optimgan._torch.models import MLP
+from optimgan import DefaultOptimGan
+from optimgan import RandomOpt
+from optimgan import MLP
 from testfunctions import (
     GoldsteinPriceFunction,
     Rosenbrock2DFunction,
@@ -42,7 +43,7 @@ D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[128], spectral_norm=False).t
 G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[128]).to(DEVICE)
 
 
-optimizer = SimpleOptimGan(
+optimizer = DefaultOptimGan(
     generator=G,
     discriminator=D,
     device=DEVICE,
