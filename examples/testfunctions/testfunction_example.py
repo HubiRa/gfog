@@ -3,17 +3,7 @@ from optimgan import DefaultOptimGan
 from optimgan import RandomOpt
 from optimgan import MLP
 from testfunctions import (
-    GoldsteinPriceFunction,
-    Rosenbrock2DFunction,
-    BealeFunction,
-    AckleyFunction,
-    HolderTableFunction,
     HimmelblauFunction,
-    ThreeHumpCamelFunction,
-    EasomFunction,
-    CrossInTrayFunction,  # results in infs: FIXME
-    McCormickFunction,
-    BukinFunction,
 )
 
 
