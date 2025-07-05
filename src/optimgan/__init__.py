@@ -4,6 +4,9 @@ from .optimgan import WassersteinOptimGan
 from .models import MLP
 from .models import DCGenerator
 from .models import DCDiscriminator
+from .buffer import Buffer
+from .buffer import HirarchicalySortedBuffer
+
 
 __all__ = [
     "DefaultOptimGan",
@@ -12,4 +15,6 @@ __all__ = [
     "MLP",
     "DCGenerator",
     "DCDiscriminator",
+    "Buffer",
+    "HirarchicalySortedBuffer",
 ]
