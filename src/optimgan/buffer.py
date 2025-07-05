@@ -17,64 +17,50 @@ class BufferBase(ABC, Generic[Tensor]):
     buffer_size: int
     buffer_dim: int
 
-    def __post_init__(self) -> None:
-        pass
+    def __post_init__(self) -> None: ...
 
     @abstractmethod
-    def get(self, idx: Union[int, slice]) -> Tensor:
-        pass
+    def get(self, idx: Union[int, slice]) -> Tensor: ...
 
     @abstractmethod
-    def insert(self, tensor: Tensor, value: Union[float, Iterable[float]]) -> None:
-        pass
+    def insert(self, tensor: Tensor, value: Union[float, Iterable[float]]) -> None: ...
 
     @abstractmethod
     def insert_many(
         self,
         tensors: List[Tensor],
         values: Union[Iterable[float], Iterable[Iterable[float]]],
-    ) -> None:
-        pass
+    ) -> None: ...
 
     @abstractmethod
-    def sort(self) -> None:
-        pass
+    def sort(self) -> None: ...
 
     @abstractmethod
-    def get_top_k(self, k: int) -> Tensor:
-        pass
+    def get_top_k(self, k: int) -> Tensor: ...
 
     @abstractmethod
-    def get_bottom_k(self, k: int) -> Tensor:
-        pass
+    def get_bottom_k(self, k: int) -> Tensor: ...
 
     @abstractmethod
-    def get_top_p(self, p: float) -> Tensor:
-        pass
+    def get_top_p(self, p: float) -> Tensor: ...
 
     @abstractmethod
-    def get_bottom_p(self, p: float) -> Tensor:
-        pass
+    def get_bottom_p(self, p: float) -> Tensor: ...
 
     @abstractmethod
-    def get_random_batch(self, batch_size: int) -> Tensor:
-        pass
+    def get_random_batch(self, batch_size: int) -> Tensor: ...
 
     @abstractmethod
-    def get_random_batch_from_top_p(self, p: float, batch_size: int) -> Tensor:
-        pass
+    def get_random_batch_from_top_p(self, p: float, batch_size: int) -> Tensor: ...
 
     @abstractmethod
-    def get_random_batch_from_top_k(self, k: int, batch_size: int) -> Tensor:
-        pass
+    def get_random_batch_from_top_k(self, k: int, batch_size: int) -> Tensor: ...
 
     @abstractmethod
-    def get_random_batch_from_bottom_p(self, p: float, batch_size: int) -> Tensor:
-        pass
+    def get_random_batch_from_bottom_p(self, p: float, batch_size: int) -> Tensor: ...
 
     @abstractmethod
-    def get_random_batch_from_bottom_k(self, k: int, batch_size: int) -> Tensor:
-        pass
+    def get_random_batch_from_bottom_k(self, k: int, batch_size: int) -> Tensor: ...
 
 
 class Buffer(BufferBase):
@@ -119,11 +105,7 @@ class Buffer(BufferBase):
         self.values.insert(idx, value)
         self.buffer.insert(idx, tensor)
 
-    def insert_many(
-        self,
-        tensors: Iterable[Tensor],
-        values: List[float],
-    ) -> None:
+    def insert_many(self, values: List[float], tensors: Iterable[Tensor]) -> None:
         """
         presort: if True, tensors and values are sorted before insertion to avoid unnecessary inserts
         TODO: check if presort is necessary in terms of efficiency

@@ -17,8 +17,9 @@ from testfunctions import (
 )
 
 
-LATENT_DIM = 2
-BATCH_SIZE = 32
+LATENT_DIM = 10
+BATCH_SIZE = 256
+BUFFER_SIZE = 2 * BATCH_SIZE
 DEVICE = torch.device("cpu")
 F_DEVICE = torch.device("cpu")
 
@@ -37,10 +38,8 @@ Y_RANGE = torch.linspace(
 )
 
 
-D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[128], spectral_norm=False).to(
-    DEVICE
-)
-G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[128]).to(DEVICE)
+D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[64], spectral_norm=False).to(DEVICE)
+G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[64]).to(DEVICE)
 
 
 optimizer = DefaultOptimGan(
@@ -50,7 +49,7 @@ optimizer = DefaultOptimGan(
     f=TEST_FUNCTION,
     f_input_dim=F_DIM,
     f_device=F_DEVICE,
-    buffer_size=100,
+    buffer_size=BUFFER_SIZE,
     optimizerG=torch.optim.Adam(lr=0.01, params=G.parameters()),
     optimizerD=torch.optim.Adam(lr=0.1, params=D.parameters()),
     batch_size=BATCH_SIZE,

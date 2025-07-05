@@ -72,7 +72,7 @@ class OptimGanBase(ABC):
 
     def lack_of_curiosity(self, x: torch.Tensor, beta=1.0) -> torch.Tensor:
         bs = x.shape[0]
-        buffer = torch.stack(self.buffer.get_random_batch(bs)).to(self.device)
+        buffer = torch.stack(self.buffer.get_top_k(bs)).to(self.device)
         x = x / x.norm(dim=-1, keepdim=True)
         buffer = buffer / buffer.norm(dim=-1, keepdim=True)
         # exploration = (beta * x @ buffer.T).softmax(dim=-1)
@@ -117,12 +117,12 @@ class DefaultOptimGan(OptimGanBase):
         out_buffer = self.discriminator(good_samples)
         loss_buffer = self.loss_fn(out_buffer, torch.ones_like(out_buffer))
 
-        # if SimpleOptimGan._x is None:
-        x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
-        x = x.to(self.device)
-        # SimpleOptimGan._x = x
-        # else:
-        # x = SimpleOptimGan._x
+        if DefaultOptimGan._x is None:
+            x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
+            x = x.to(self.device)
+            DefaultOptimGan._x = x
+        else:
+            x = DefaultOptimGan._x
 
         with torch.no_grad():
             gen_samples = self.generator(x)
@@ -134,9 +134,9 @@ class DefaultOptimGan(OptimGanBase):
         self.optimizerD.step()
 
         # train generator
-        x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
-        x = x.to(self.device)
-        # x = SimpleOptimGan._x
+        # x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
+        # x = x.to(self.device)
+        x = DefaultOptimGan._x
 
         # forward pass
         x = self.generator(x)
