@@ -1,6 +1,6 @@
-from .optimgan import DefaultOptimGan
-from .optimgan import RandomOpt
-from .optimgan import WassersteinOptimGan
+from .adversa import DefaultOpt
+from .adversa import RandomOpt
+from .adversa import WsOpt
 from .models import MLP
 from .models import DCGenerator
 from .models import DCDiscriminator
@@ -9,9 +9,9 @@ from .buffer import HirarchicalySortedBuffer
 
 
 __all__ = [
-    "DefaultOptimGan",
+    "DefaultOpt",
     "RandomOpt",
-    "WassersteinOptimGan",
+    "WsOpt",
     "MLP",
     "DCGenerator",
     "DCDiscriminator",

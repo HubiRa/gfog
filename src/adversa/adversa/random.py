@@ -1,9 +1,9 @@
 import torch
 
-from .base import OptimGanBase
+from .base import BaseOpt
 
 
-class RandomOpt(OptimGanBase):
+class RandomOpt(BaseOpt):
     def step(self) -> torch.Tensor:
         x = torch.rand(self.batch_size, self.buffer.buffer_dim)
         # function evaluation

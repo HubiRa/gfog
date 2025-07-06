@@ -1,9 +1,9 @@
 import torch
 from tqdm import tqdm
-from .base import OptimGanBase
+from .base import BaseOpt
 
 
-class DefaultOptimGan(OptimGanBase):
+class DefaultOpt(BaseOpt):
     _x = None
 
     def step(self) -> torch.Tensor:
@@ -19,12 +19,12 @@ class DefaultOptimGan(OptimGanBase):
         out_buffer = self.discriminator(good_samples)
         loss_buffer = self.loss_fn(out_buffer, torch.ones_like(out_buffer))
 
-        if DefaultOptimGan._x is None:
-            x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
-            x = x.to(self.device)
-            DefaultOptimGan._x = x
-        else:
-            x = DefaultOptimGan._x
+        # if DefaultOpt._x is None:
+        x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
+        x = x.to(self.device)
+        # DefaultOpt._x = x
+        # else:
+        # x = DefaultOpt._x
 
         with torch.no_grad():
             gen_samples = self.generator(x)
@@ -36,9 +36,9 @@ class DefaultOptimGan(OptimGanBase):
         self.optimizerD.step()
 
         # train generator
-        # x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
-        # x = x.to(self.device)
-        x = DefaultOptimGan._x
+        x = torch.rand(self.batch_size, self.latent_dim).to(self.device) * 2 - 1
+        x = x.to(self.device)
+        # x = DefaultOpt._x
 
         # forward pass
         x = self.generator(x)

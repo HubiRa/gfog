@@ -1,7 +1,11 @@
 import torch
-from optimgan import DefaultOptimGan
-from optimgan import RandomOpt
-from optimgan import MLP
+import sys
+import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+from adversa import DefaultOpt
+from adversa import RandomOpt
+from adversa import MLP
 from testfunctions import (
     HimmelblauFunction,
 )
@@ -28,11 +32,13 @@ Y_RANGE = torch.linspace(
 )
 
 
-D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[64], spectral_norm=False).to(DEVICE)
-G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[64]).to(DEVICE)
+D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[256], spectral_norm=False).to(
+    DEVICE
+)
+G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[256]).to(DEVICE)
 
 
-optimizer = DefaultOptimGan(
+optimizer = DefaultOpt(
     generator=G,
     discriminator=D,
     device=DEVICE,
@@ -44,7 +50,7 @@ optimizer = DefaultOptimGan(
     optimizerD=torch.optim.Adam(lr=0.1, params=D.parameters()),
     batch_size=BATCH_SIZE,
     latent_dim=LATENT_DIM,
-    curiosity=100,
+    curiosity=1,
 )
 
 

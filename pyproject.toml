@@ -1,7 +1,7 @@
 [project]
-name = "optimgan"
+name = "adverse"
 version = "0.1.0"
-description = "Add your description here"
+description = "Gradient free optimization via gradients"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

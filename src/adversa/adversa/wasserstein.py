@@ -1,9 +1,9 @@
 import torch
 from tqdm import tqdm
-from .base import OptimGanBase
+from .base import BaseOpt
 
 
-class WassersteinOptimGan(OptimGanBase):
+class WsOpt(BaseOpt):
     def step(self) -> torch.Tensor:
         # zero grad
         self.optimizerG.zero_grad()

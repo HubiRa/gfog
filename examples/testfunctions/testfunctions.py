@@ -8,7 +8,10 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 import seaborn as sns
 
-from optimgan.utils import maybe_unsqueeze
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+from adversa.utils import maybe_unsqueeze
 
 
 class InputLayout:

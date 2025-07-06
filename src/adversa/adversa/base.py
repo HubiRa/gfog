@@ -5,10 +5,10 @@ from loguru import logger
 from abc import ABC, abstractmethod
 from typing import Callable
 
-from optimgan.buffer import Buffer
+from ..buffer import Buffer
 
 
-class OptimGanBase(ABC):
+class BaseOpt(ABC):
     def __init__(
         self,
         f: Callable[[torch.Tensor], torch.Tensor],
@@ -81,7 +81,9 @@ class OptimGanBase(ABC):
         # exploitation_loss = (exploration - 1./bs).abs().mean()
         internal_curiosity_loss = (internal_curiosity.diag() - 1.0).abs().mean()
         # logger.debug(f'exploration_loss = {exploration_loss}, internal_curiosity_loss = {internal_curiosity_loss}')
-        return exploration_loss  # + internal_curiosity_loss
+        # return exploration_loss  # + internal_curiosity_loss
+        # return internal_curiosity_loss
+        return exploration_loss + internal_curiosity_loss
 
     @abstractmethod
     def step(self) -> torch.Tensor:
