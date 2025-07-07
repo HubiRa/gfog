@@ -10,8 +10,9 @@ import seaborn as sns
 
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
-from adversa.utils import maybe_unsqueeze
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+from gopt.utils import maybe_unsqueeze
 
 
 class InputLayout:

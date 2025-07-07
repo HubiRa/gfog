@@ -44,8 +44,7 @@ class BaseOpt(ABC):
         self.init_buffer()
 
     @abstractmethod
-    def optimize(self, x_intial: torch.Tensor) -> torch.Tensor:
-        pass
+    def optimize(self, x_intial: torch.Tensor) -> torch.Tensor: ...
 
     def init_sampler(self) -> torch.Tensor:
         # print(f'debbug:::self.batch_size = {self.batch_size}')

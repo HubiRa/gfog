@@ -3,9 +3,9 @@ import sys
 import os
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-from adversa import DefaultOpt
-from adversa import RandomOpt
-from adversa import MLP
+from gfog import DefaultOpt
+from gfog import RandomOpt
+from gfog import MLP
 from testfunctions import (
     HimmelblauFunction,
 )
