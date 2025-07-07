@@ -35,7 +35,7 @@ class WsOpt(BaseOpt):
         x = self.generator(x)
 
         # panalize lack of curiousity
-        loss_curiosity = self.lack_of_curiosity(x)
+        loss_curiosity = self.incuriosity(x)
 
         # get disciminator output
         outG = self.discriminator(x)

@@ -10,7 +10,7 @@ from testfunctions import (
     HimmelblauFunction,
 )
 
-
+# TODO: Adapt to new components!
 LATENT_DIM = 10
 BATCH_SIZE = 256
 BUFFER_SIZE = 2 * BATCH_SIZE

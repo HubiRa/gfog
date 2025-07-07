@@ -1,16 +1,14 @@
 import numpy as np
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Union, Iterable, Generic, TypeVar
+from typing import List, Union, Iterable
 
 from random import sample
-
-
-Tensor = TypeVar("Tensor")  # Can be any type
+from torch import Tensor
 
 
 @dataclass
-class BufferBase(ABC, Generic[Tensor]):
+class BufferBase(ABC):
     buffer_size: int
     buffer_dim: int
     buffer: List[Tensor] | None = None
