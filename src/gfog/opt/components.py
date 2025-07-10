@@ -1,11 +1,10 @@
 from dataclasses import dataclass
-from typing import Callable, TypeAlias, Tuple
+from typing import Callable, Tuple
 import torch
 from torch import nn
 from ..curiosity import CuriosityLossBase
-from torch.nn import _Loss
 from ..buffer.base import BufferBase
-from latent_sample import LatentSamplerBase
+from .latents_sampler import LatentSamplerBase
 
 
 @dataclass
@@ -23,12 +22,12 @@ LatentDim = int | Tuple[int, int]
 class GAN:
     G: nn.Module
     D: nn.Module
-    loss: _Loss
+    loss: nn.Module
+    curiosity_loss: CuriosityLossBase
     latent_dim: LatentDim
     optimizerG: torch.optim.Optimizer
     optimizerD: torch.optim.Optimizer
     latent_sampler: LatentSamplerBase
-    curiosity: CuriosityLossBase
     device: torch.device
     dtype: torch.dtype
 
@@ -41,7 +40,7 @@ class Buffer:
 
 @dataclass
 class OptComponents:
-    f: Fn
+    fn: Fn
     gan: GAN
     batch_size: int
     buffer: Buffer

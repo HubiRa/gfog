@@ -1,6 +1,6 @@
 from .base import BufferBase
-from .default import Buffer
+from .default import SimpleBuffer
 from .hirarchical import HirarchicalySortedBuffer
 
 
-__all__ = ["Buffer", "HirarchicalySortedBuffer", "BufferBase"]
+__all__ = ["SimpleBuffer", "HirarchicalySortedBuffer", "BufferBase"]

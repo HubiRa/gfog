@@ -1,20 +1,6 @@
-from .opt import DefaultOpt
-from .opt import RandomOpt
-from .opt import WsOpt
-from .models import MLP
-from .models import DCGenerator
-from .models import DCDiscriminator
-from .buffer import Buffer
-from .buffer import HirarchicalySortedBuffer
+from gfog import curiosity
+from . import opt
+from . import buffer
+from . import models
 
-
-__all__ = [
-    "DefaultOpt",
-    "RandomOpt",
-    "WsOpt",
-    "MLP",
-    "DCGenerator",
-    "DCDiscriminator",
-    "Buffer",
-    "HirarchicalySortedBuffer",
-]
+__all__ = ["models", "opt", "curiosity", "buffer"]

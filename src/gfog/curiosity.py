@@ -1,5 +1,3 @@
-from abc import ABC
-from abc import abstractmethod
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -15,22 +13,20 @@ class CuriosityLossBaseConfig:
     pass
 
 
-class CuriosityLossBase(ABC, nn.Module):
+class CuriosityLossBase(nn.Module):
     def __init__(
         self,
         config: CuriosityLossBaseConfig,
         buffer: BufferBase | None = None,
         **kwargs,
     ) -> None:
+        super().__init__()
         self.config = config
         self.buffer = buffer
 
-    @abstractmethod
-    def forward(self, G_out: torch.Tensor) -> torch.Tensor: ...
-
 
 @dataclass
-class CuriosityLossConfig:
+class CuriosityLossConfig(CuriosityLossBaseConfig):
     temperature: float = 0.7
 
     # NOTE: a value <= 0 deactivates the loss
@@ -38,10 +34,6 @@ class CuriosityLossConfig:
     calc_cross_sim: float = 0.5
 
     def __post_init__(self):
-        if not any([v > 0 for v in [self.calc_cross_sim, self.calc_self_sim]]):
-            raise ValueError(
-                "At least one of calc_self_sim and calc_cross_sim must be > 0!"
-            )
         self.calc_cross_sim = self.calc_cross_sim if self.calc_cross_sim > 0.0 else 0.0
         self.calc_self_sim = self.calc_self_sim if self.calc_self_sim > 0.0 else 0.0
 
@@ -52,6 +44,7 @@ class CuriosityLoss(CuriosityLossBase):
     def __init__(
         self, config: CuriosityLossConfig, buffer: BufferBase | None = None, **kwargs
     ) -> None:
+        super().__init__(config, buffer)
         self.config = config
         if self.config.calc_cross_sim and not buffer:
             raise ValueError(
@@ -60,15 +53,15 @@ class CuriosityLoss(CuriosityLossBase):
         self.buffer: BufferBase | None = buffer
 
     def forward(self, G_out: torch.Tensor) -> torch.Tensor:
-        bs = G_out.sizse(0)
+        bs = G_out.size(0)
         loss = 0
         if self.config.calc_cross_sim and self.buffer:
-            loss = loss + self.calc_cross_sim * cross_similarity_loss(
+            loss = loss + self.config.calc_cross_sim * cross_similarity_loss(
                 G_out, self.buffer.get_top_k(bs), temperature=self.config.temperature
             )
 
         if self.config.calc_self_sim:
-            loss = loss + self.calc_self_sim * self_similarity_loss(
+            loss = loss + self.config.calc_self_sim * self_similarity_loss(
                 G_out, temperature=self.config.temperature
             )
         return loss
@@ -83,15 +76,15 @@ class CuriositySiglipLoss(CuriosityLoss):
     """Loss is based on Siglip loss"""
 
     def forward(self, G_out: torch.Tensor) -> torch.Tensor:
-        bs = G_out.sizse(0)
+        bs = G_out.size(0)
         loss = 0
         if self.config.calc_cross_sim and self.buffer:
-            loss = loss + self.calc_cross_sim * cross_siglip(
+            loss = loss + self.config.calc_cross_sim * cross_siglip(
                 G_out, self.buffer.get_top_k(bs), temperature=self.config.temperature
             )
 
         if self.config.calc_self_sim:
-            loss = loss + self.calc_self_sim * self_siglip(
+            loss = loss + self.config.calc_self_sim * self_siglip(
                 G_out, temperature=self.config.temperature
             )
         return loss

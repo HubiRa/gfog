@@ -1,4 +1,4 @@
-from .default import Buffer
+from .default import SimpleBuffer
 import bisect
 import numpy as np
 
@@ -8,7 +8,7 @@ from typing import List, Iterable, TypeVar
 Tensor = TypeVar("Tensor")  # Can be any type
 
 
-class HirarchicalySortedBuffer(Buffer):
+class HirarchicalySortedBuffer(SimpleBuffer):
     """
     sortes buffer according to a hirarchy of values
     """

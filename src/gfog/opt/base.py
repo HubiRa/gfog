@@ -1,22 +1,19 @@
 import torch
-import torch.nn as nn
 
 from loguru import logger
 from abc import ABC, abstractmethod
-from typing import Callable
 from tqdm import tqdm
 
-from ..buffer import DefaultBuffer
-from components import OptComponents
+from .components import OptComponents
 
 
 class BaseOpt(ABC):
     def __init__(self, components: OptComponents) -> None:
         self.components = components
         # convenience:
-        self.f = self.components.f
+        self.f = self.components.fn
         self.gan = self.components.gan
-        self.buffer = self.buffer
+        self.buffer = self.components.buffer
         self.init_buffer()
 
     def init_buffer(self) -> None:

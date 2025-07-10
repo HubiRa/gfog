@@ -9,7 +9,7 @@ from loguru import logger
 Tensor = TypeVar("Tensor")  # Can be any type
 
 
-class Buffer(BufferBase):
+class SimpleBuffer(BufferBase):
     """
     Simple buffer that stores tensors sorted w.r.t. values
     """
@@ -63,7 +63,7 @@ class Buffer(BufferBase):
         return return_len
 
 
-class HirarchicalySortedBuffer(Buffer):
+class HirarchicalySortedBuffer(SimpleBuffer):
     """
     sortes buffer according to a hirarchy of values
     """
@@ -72,7 +72,6 @@ class HirarchicalySortedBuffer(Buffer):
 
     def __post_init__(self) -> None:
         assert self.buffer_size > 0
-        assert self.buffer_dim > 0
         assert self.value_levels > 0
 
         if self.values is None:
@@ -119,7 +118,7 @@ class HirarchicalySortedBuffer(Buffer):
 
 
 if __name__ == "__main__":
-    buffer = Buffer(buffer_size=10, buffer_dim=2)
+    buffer = SimpleBuffer(buffer_size=10)
     print(buffer.buffer)
     buffer.insert_many(
         values=[0.4, 0.2, 0.1], tensors=list(Tensor([[1, 2], [3, 4], [5, 6]]))

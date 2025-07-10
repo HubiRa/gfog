@@ -11,14 +11,14 @@ class DefaultOpt(BaseOpt):
         self.gan.optimizerG.zero_grad()
         self.gan.optimizerD.zero_grad()
 
-        elite = torch.stack(self.buffer.B.get_top_k(k=self.components.batch_size)).to(
+        elite = self.buffer.B.get_top_k(k=self.components.batch_size).to(
             self.gan.device
         )
 
         out_buffer = self.gan.D(elite)
         loss_buffer = self.gan.loss(out_buffer, torch.ones_like(out_buffer))
 
-        # TODO: replace with x = self.gan.latent_sampler()
+        # TODO: replace with x = self.gan.latent_sampler(batch_size)
         x = (
             torch.rand(self.components.batch_size, self.gan.latent_dim).to(
                 self.gan.device
@@ -54,10 +54,10 @@ class DefaultOpt(BaseOpt):
         x = self.gan.G(x)
 
         # panalize lack of curiousity
-        loss_curiosity = self.gan.curiosity(x)
+        loss_curiosity = self.gan.curiosity_loss(x)
 
         # get disciminator output
-        outG = self.gan.G(x)
+        outG = self.gan.D(x)
 
         # calculate loss
         lossG = self.gan.loss(outG, torch.ones_like(outG))
