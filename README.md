@@ -7,8 +7,14 @@
 **Gfog** is a gradient-free optimization library using GANs to find solutions to black-box optimization problems — potentially discovering multiple optima.
 It builds upon and improves the method proposed in the paper [A GAN based solver of black-box inverse problems](https://openreview.net/pdf?id=rJeNnm25US) (OptimGan)
 
-![Optimization Animation](./assets/examples.gif)
-**Gfog** finding all four minima of the Himmelblau function
+## Example: [Himmelblau's function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
+
+<p align="center">
+  <img src="./assets/example.gif" alt="Demo" width="500" />
+</p>
+
+<p align="center"><em>Gfog finding all four minima of the Himmelblau function
+</em></p>
 
 ---
 
