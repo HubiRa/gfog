@@ -4,7 +4,7 @@ from loguru import logger
 from abc import ABC, abstractmethod
 from tqdm import tqdm
 
-from .components import OptComponents
+from ..components import OptComponents
 
 
 class BaseOpt(ABC):

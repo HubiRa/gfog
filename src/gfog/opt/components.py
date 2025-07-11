@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Any
 import torch
 from torch import nn
 from ..curiosity import CuriosityLossBase
@@ -9,7 +9,7 @@ from .latents_sampler import LatentSamplerBase
 
 @dataclass
 class Fn:
-    f: Callable[[torch.Tensor], torch.Tensor]
+    f: Callable[[torch.Tensor], Any]
     input_dim: int
     device: torch.device
     dtype: torch.dtype
@@ -35,7 +35,7 @@ class GAN:
 @dataclass
 class Buffer:
     B: BufferBase
-    # TODO elite selection
+    # TODO: elite selection
 
 
 @dataclass

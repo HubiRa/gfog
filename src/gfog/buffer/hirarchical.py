@@ -1,4 +1,4 @@
-from .default import SimpleBuffer
+from .simple import SimpleBuffer
 import bisect
 import numpy as np
 

@@ -1,4 +1,4 @@
-from gfog import curiosity
+from . import curiosity
 from . import opt
 from . import buffer
 from . import models

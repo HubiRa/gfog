@@ -1,5 +1,5 @@
 from .base import BufferBase
-from .default import SimpleBuffer
+from .simple import SimpleBuffer
 from .hirarchical import HirarchicalySortedBuffer
 
 
