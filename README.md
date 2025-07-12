@@ -1,26 +1,15 @@
 <div align="center">
-  <img src="assets/gfog.png" alt="Gfog Logo" width="250">
+  <img src="assets/gfog.png" alt="GFog Logo" width="250">
 </div>
 
-# Gfog - Gradient-Free Optimization via Gradients
+# GFog - Gradient-Free Optimization via Gradients
 
-**Gfog** is a gradient-free optimization library using GANs to find solutions to black-box optimization problems — potentially discovering multiple optima.
+**GFog** is a gradient-free optimization library using GANs to find solutions to black-box optimization problems — potentially discovering multiple optima.
 It builds upon and improves the method proposed in the paper [A GAN based solver of black-box inverse problems](https://openreview.net/pdf?id=rJeNnm25US) (OptimGan)
-
-## Example: [Himmelblau's function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
-
-<p align="center">
-  <img src="./assets/example.gif" alt="Demo" width="500" />
-</p>
-
-<p align="center"><em>Gfog finding all four minima of the Himmelblau function
-</em></p>
-
----
 
 ## Quick Start
 
-To run the example shown in [at the top](#Gfog) run the following from the Gfog base directory:
+To run the example shown [below](#Example) run the following from the GFog base directory:
 
 ```python
 # create and activate venv
@@ -37,24 +26,47 @@ uv pip install -e .
 python examples/testfunctions/example.py
 ```
 
-## Code Example
-
-TODO
-
 ## Improvements to OptimGan
 
-**Gfog** introduces two improvements over **OptimGan**:
+**GFog** introduces two improvements over **OptimGan**:
 
 1. Curiosity Loss
 
    **OptimGan** often stalled before reaching a solution. This is counter intuitive — one might expect a GAN to explore and even discover multiple solutions.
-   **Gfog** adds a curiosity loss that encourages exploration and often leads to discovering multiple solutions.
+   **GFog** adds a curiosity loss that encourages exploration and often leads to discovering multiple solutions.
 
 2. Hierarchically Sorted Buffer
 
-   **Gfog** supports multiple objectives using a hierarchically sorted buffer.
+   **GFog** supports multiple objectives using a hierarchically sorted buffer.
    For example, in a constrained optimization problem, each constraint can define a hierarchy level.
    This avoids the need to merge objectives of potentially vastly different magnitudes into a single loss
+
+## Example: [Himmelblau's function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <img src="./assets/example.gif" alt="With Curiosity" width="400" />
+        <br>
+        <em>With Curiosity Loss</em>
+      </td>
+      <td align="center">
+        <img src="./assets/example_not_curious.gif" alt="Without Curiosity" width="400" />
+        <br>
+        <em>Without Curiosity Loss</em>
+      </td>
+    </tr>
+  </table>
+</div>
+
+<p align="center"><em>Comparison showing how curiosity loss helps discover all four minima but also taking more iterations</em></p>
+
+---
+
+## Code Example
+
+TODO
 
 ## How it works
 

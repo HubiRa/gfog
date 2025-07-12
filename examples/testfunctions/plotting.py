@@ -13,9 +13,15 @@ from loguru import logger
 from tqdm import tqdm
 
 # Set seaborn style for better aesthetics
-sns.set_style("whitegrid")
-sns.set_palette("husl")
-plt.style.use("seaborn-v0_8-darkgrid")
+sns.set_style("darkgrid")
+sns.set_palette("colorblind")
+plt.rcParams["figure.facecolor"] = "#222222"  # Dark grey background
+plt.rcParams["axes.facecolor"] = "#222222"    # Dark grey axes background
+plt.rcParams["text.color"] = "white"          # White text
+plt.rcParams["axes.labelcolor"] = "white"     # White axis labels
+plt.rcParams["xtick.color"] = "white"         # White x-axis ticks
+plt.rcParams["ytick.color"] = "white"         # White y-axis ticks
+plt.rcParams["axes.edgecolor"] = "white"      # White axis borders
 
 
 def plot_optimization_gif(
@@ -25,7 +31,7 @@ def plot_optimization_gif(
     buffer_history: List[torch.Tensor],
     iteration_numbers: List[int],
     filename: str = "optimization.gif",
-    cmap: str = "crest",
+    cmap: str = "viridis",
     n_contours: int = 30,
     figsize: tuple = (10, 8),
     show_minima: bool = True,
@@ -76,12 +82,12 @@ def plot_optimization_gif(
             Y,
             Z,
             levels=n_contours,
-            cmap=sns.color_palette(cmap, as_cmap=True),
+            cmap=cmap,  # viridis is inherently colorblind-friendly
             alpha=0.85,
             norm=norm,
         )
         ax.contour(
-            X, Y, Z, levels=n_contours, colors="white", alpha=0.4, linewidths=1.0
+            X, Y, Z, levels=n_contours, colors="lightgray", alpha=0.6, linewidths=1.0
         )
 
         # Plot known minima
@@ -90,7 +96,7 @@ def plot_optimization_gif(
             and hasattr(test_function, "known_minima")
             and test_function.known_minima is not None
         ):
-            minima_color = sns.color_palette("Set2")[4]  # Nice purple
+            minima_color = "#D55E00"  # Colorblind-friendly orange
             for minimum in test_function.known_minima:
                 min_np = minimum.detach().cpu().numpy()
                 ax.plot(
@@ -111,7 +117,7 @@ def plot_optimization_gif(
             points_to_show = buffer_points[:n_show]
             points_np = points_to_show.detach().cpu().numpy()
 
-            buffer_color = sns.color_palette("Set2")[1]
+            buffer_color = "#FFFFFF"  # White for maximum contrast against viridis
             ax.scatter(
                 points_np[:, 0],
                 points_np[:, 1],

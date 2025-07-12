@@ -176,4 +176,11 @@ poetry.toml
 .DS_Store
 **/wandb/
 *.zip
+*.gif
+assets/*
+!assets/.gitkeep
+!assets/example.gif
+!assets/gfog.png
+!assets/example_not_curious.gif
+
 # End of https://www.toptal.com/developers/gitignore/api/python
