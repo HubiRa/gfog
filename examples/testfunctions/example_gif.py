@@ -7,7 +7,7 @@ import torch
 from gfog.opt import DefaultOpt
 from gfog.models import MLP
 from gfog.opt import components
-from gfog.buffer import Buffer  # SimpleBuffer
+from gfog.buffer import Buffer, SimpleBuffer
 from gfog.opt.latents_sampler import LatentSamplerLambda
 from torch.nn import BCEWithLogitsLoss
 from loguru import logger
@@ -38,8 +38,8 @@ plot_ranges = TEST_FUNCTION.get_plot_ranges(n_points=100)
 # GAN used for optimization
 # -------------------------
 
-LATENT_DIM = 250
-BATCH_SIZE = 64
+LATENT_DIM = 2
+BATCH_SIZE = 100
 
 GAN_DEVICE = torch.device("cpu")
 G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[32]).to(GAN_DEVICE)
@@ -48,7 +48,7 @@ D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[32], spectral_norm=False).to
 )
 
 
-buffer = components.BufferComp(B=Buffer(buffer_size=2 * BATCH_SIZE))
+buffer = components.BufferComp(B=SimpleBuffer(buffer_size=2 * BATCH_SIZE))
 
 gan = components.GAN(
     G=G,
@@ -88,7 +88,9 @@ def main() -> None:
         optimizer.step()
 
         if i % GIF_SAMPLE_RATE == 0 or i == N_ITER - 1:  # Include first and last
-            buffer_history.append(buffer.B.get_top_k(k=buffer.B.buffer_size).clone())
+            print(f"{ buffer.B.tensor_buffer.shape =}")
+            buffer_history.append(buffer.B.tensor_buffer.clone())
+            # buffer_history.append(buffer.B.get_top_k(k=buffer.B.buffer_size).clone())
             iteration_numbers.append(i)  # Track the true iteration number
 
         best_values.append(buffer.B.get_value(0))
