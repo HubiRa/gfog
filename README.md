@@ -23,7 +23,7 @@ uv sync
 uv pip install -e .
 
 # Run example
-python examples/testfunctions/example.py
+python examples/testfunctions/example_gif.py
 ```
 
 ## Improvements to OptimGan

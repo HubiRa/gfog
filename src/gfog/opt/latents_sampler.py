@@ -9,12 +9,13 @@ class LatentSamplerBase(ABC):
         pass
 
     @abstractmethod
-    def __call__(self, **kwargs) -> torch.Tensor: ...
+    def __call__(self) -> torch.Tensor: ...
 
 
 class LatentSamplerLambda(LatentSamplerBase):
-    def __init__(self, callable: Callable, **kwargs) -> None:
-        self.callable = callable
+    def __init__(self, f: Callable, **kwargs) -> None:
+        self.f = f
+        self.kwargs = kwargs
 
-    def __call__(self, **kwargs) -> torch.Tensor:
-        return self.callable()
+    def __call__(self) -> torch.Tensor:
+        return self.f(**self.kwargs)

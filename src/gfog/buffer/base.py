@@ -1,14 +1,16 @@
 import numpy as np
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Union, Iterable
+
+# from dataclasses import dataclass
+from typing import List, Iterable
+import attr
 
 from random import sample
 from torch import Tensor
 import torch
 
 
-@dataclass
+@attr.define(kw_only=True)
 class BufferBase(ABC):
     buffer_size: int
     buffer: List[Tensor] | None = None
@@ -35,16 +37,17 @@ class BufferBase(ABC):
         self.buffer = [self.buffer[i] for i in idx_sorted]
 
     @abstractmethod
-    def insert(self, tensor: Tensor, value: Union[float, Iterable[float]]) -> None: ...
+    def insert(self, tensor: Tensor, value: float | Iterable[float]) -> None: ...
 
     @abstractmethod
     def insert_many(
         self,
         tensors: List[Tensor],
-        values: Union[Iterable[float], Iterable[Iterable[float]]],
+        values: Iterable[float] | Iterable[Iterable[float]],
     ) -> None: ...
 
-    def get(self, idx: Union[int, slice]) -> Tensor:
+    def get(self, idx: int | slice) -> Tensor:
+        breakpoint()
         return self.buffer[idx]
 
     def get_top_k(self, k: int) -> List[Tensor]:

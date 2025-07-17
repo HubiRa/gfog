@@ -5,10 +5,13 @@ from typing import List, Iterable, TypeVar
 
 from .base import BufferBase
 from loguru import logger
+from torch import Tensor
 
-Tensor = TypeVar("Tensor")  # Can be any type
+# from dataclasses import dataclass
+import attr
 
 
+@attr.s(kw_only=True)
 class SimpleBuffer(BufferBase):
     """
     Simple buffer that stores tensors sorted w.r.t. values
@@ -23,7 +26,11 @@ class SimpleBuffer(BufferBase):
         self.values = [self.values[i] for i in idx_sorted]
         self.buffer = [self.buffer[i] for i in idx_sorted]
 
-    def insert(self, value: float, tensor: Tensor) -> None:
+    def insert(
+        self,
+        tensor: Tensor,
+        value: float | Iterable,
+    ) -> None:
         """inserts one element into the buffer"""
         if len(self.buffer) == self.buffer_size:
             # if the buffer is full, remove the largest value
@@ -36,7 +43,11 @@ class SimpleBuffer(BufferBase):
         self.values.insert(idx, value)
         self.buffer.insert(idx, tensor)
 
-    def insert_many(self, values: List[float], tensors: Iterable[Tensor]) -> None:
+    def insert_many(
+        self,
+        tensors: Iterable[Tensor],
+        values: Iterable[float] | Iterable[Iterable[float]],
+    ) -> None:
         """
         presort: if True, tensors and values are sorted before insertion to avoid unnecessary inserts
         TODO: check if presort is necessary in terms of efficiency

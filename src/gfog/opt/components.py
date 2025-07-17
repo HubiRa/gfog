@@ -3,7 +3,9 @@ from typing import Callable, Tuple, Any
 import torch
 from torch import nn
 from ..curiosity import CuriosityLossBase
-from ..buffer.base import BufferBase
+
+# from ..buffer.base import BufferBase, Buffer
+from ..buffer import Buffer
 from .latents_sampler import LatentSamplerBase
 
 
@@ -33,8 +35,8 @@ class GAN:
 
 
 @dataclass
-class Buffer:
-    B: BufferBase
+class BufferComp:
+    B: Buffer
     # TODO: elite selection
 
 
@@ -43,4 +45,4 @@ class OptComponents:
     fn: Fn
     gan: GAN
     batch_size: int
-    buffer: Buffer
+    buffer: BufferComp

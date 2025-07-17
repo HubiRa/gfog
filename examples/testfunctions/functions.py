@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 
 @dataclass
@@ -24,7 +24,7 @@ class TestFunctionBase(ABC):
         self.known_minima: Optional[List[torch.Tensor]] = None
 
     @abstractmethod
-    def f(self, x: torch.Tensor) -> torch.Tensor:
+    def f(self, x: torch.Tensor) -> torch.Tensor | Dict[str, torch.Tensor]:
         """
         Evaluate function on input tensor.
         Input: (..., input_dim) - any batch dimensions + feature dimension
@@ -204,3 +204,28 @@ class ThreeHumpCamelFunction(TestFunctionBase):
         x_val = x[..., 0]
         y_val = x[..., 1]
         return 2 * x_val**2 - 1.05 * x_val**4 + x_val**6 / 6 + x_val * y_val + y_val**2
+
+
+class MishrasBirdFunctionConstraint(TestFunctionBase):
+    def __init__(self):
+        super().__init__(input_dim=2)
+        self.set_domain(lower=torch.tensor([-10, -6.5]), upper=torch.tensor([5, 5]))
+        self.known_minima = [torch.tensor([-3.1302468, -1.5821422])]
+
+    def _get_constraint(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # contraint: (x + 5)**2 + (y + 5)**2 - 25 < 0
+        # we return the how much this constraint is violated
+        violation = (x + 5) ** 2 + (y + 5) ** 2 - 25
+        return torch.max(torch.zeros(len(x)), violation)
+
+    def f(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        x = self._validate_and_project(x)
+        x_val = x[..., 0]
+        y_val = x[..., 1]
+        fx = (
+            torch.sin(y_val) * torch.exp((1 - torch.cos(x_val) ** 2))
+            + torch.cos(x_val) * torch.exp((1 - torch.sin(y_val)) ** 2)
+            + (x_val - y_val) ** 2
+        )
+        constraint = self._get_constraint(x_val, y_val)
+        return {"fx": fx, "constraints": constraint}

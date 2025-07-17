@@ -2,17 +2,22 @@ from .simple import SimpleBuffer
 import bisect
 import numpy as np
 
-from typing import List, Iterable, TypeVar
+from torch import Tensor
+from typing import List, Iterable
+
+# from dataclasses import dataclass
+import attr
+from loguru import logger
+from tqdm import tqdm
 
 
-Tensor = TypeVar("Tensor")  # Can be any type
-
-
+@attr.define(kw_only=True)
 class HirarchicalySortedBuffer(SimpleBuffer):
     """
     sortes buffer according to a hirarchy of values
     """
 
+    # TODO: revisit whole implementation
     value_levels: int
 
     def __post_init__(self) -> None:
@@ -37,8 +42,10 @@ class HirarchicalySortedBuffer(SimpleBuffer):
         self.values = [self.values[i] for i in idx_sorted]
         self.buffer = [self.buffer[i] for i in idx_sorted]
 
-    def insert(self, value: Iterable, tensor: Tensor) -> None:
+    def insert(self, tensor: Tensor, value: Iterable[float]) -> None:
         """inserts one element into the buffer"""
+        self.buffer: List[Tensor]
+        self.values: List[float]
         assert len(value) == self.value_levels
         idx = bisect.bisect_left(self.values, value)
         self.values.insert(idx, value)
@@ -48,13 +55,22 @@ class HirarchicalySortedBuffer(SimpleBuffer):
         self.buffer = self.buffer[:-1]
 
     def insert_many(
-        self, values: Iterable[Iterable[float]], tensors: List[Tensor]
+        self,
+        tensors: List[Tensor],
+        values: Iterable[Iterable[float]],
     ) -> None:
         """
         naive implementation: call insert for all values
         TODO: implement less wasteful version
         """
+        if not values:
+            raise ValueError("values array is empty")
         # presort tensors and values
+        if not isinstance(values[0], Iterable):
+            raise ValueError(
+                "hirarchical buffer expects multiple value levels. If the function only returns one value, consider using SimpleBuffer"
+            )
+
         for v, t in zip(values, tensors):
             self.insert(value=v, tensor=t)
 
