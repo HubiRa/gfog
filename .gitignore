@@ -182,5 +182,7 @@ assets/*
 !assets/example.gif
 !assets/gfog.png
 !assets/example_not_curious.gif
+!assets/example_misrha_constraint.gif
+!assets/example_misrha_no_constraint.gif
 
 # End of https://www.toptal.com/developers/gitignore/api/python

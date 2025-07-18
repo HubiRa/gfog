@@ -9,7 +9,7 @@ It builds upon and improves the method proposed in the paper [A GAN based solver
 
 ## Quick Start
 
-To run the example shown [below](#Example) run the following from the GFog base directory:
+To run the example shown [below](#examples) run the following from the GFog base directory (the project uses [uv](https://docs.astral.sh/uv/)):
 
 ```python
 # create and activate venv
@@ -17,13 +17,10 @@ uv venv
 source .venv/bin/activate
 
 # Install dependencies
-uv sync
+bash install.sh
 
-# install gfog in editable mode
-uv pip install -e .
-
-# Run example
-python examples/testfunctions/example_gif.py
+# Run example for himmelblau function
+python examples/testfunctions/example_himmelblau.py
 ```
 
 ## Improvements to OptimGan
@@ -32,7 +29,7 @@ python examples/testfunctions/example_gif.py
 
 1. Curiosity Loss
 
-   **OptimGan** often stalled before reaching a solution. This is counter intuitive — one might expect a GAN to explore and even discover multiple solutions.
+   **OptimGan** frequently stalled before converging, despite expectations that a GAN would explore and potentially uncover multiple solutions.
    **GFog** adds a curiosity loss that encourages exploration and often leads to discovering multiple solutions.
 
 2. Hierarchically Sorted Buffer
@@ -40,8 +37,22 @@ python examples/testfunctions/example_gif.py
    **GFog** supports multiple objectives using a hierarchically sorted buffer.
    For example, in a constrained optimization problem, each constraint can define a hierarchy level.
    This avoids the need to merge objectives of potentially vastly different magnitudes into a single loss
+   It is as easy as letting the function to optimize return multiple values and tell the buffer to expect the
+   number of returned values:
 
-## Example: [Himmelblau's function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
+```python
+# - the buffer expects two outputs from the function
+# - sorting order is determined by the order in the list
+# - we can give the levels names to make the targets explicit
+buffer = Buffer(
+    buffer_size=buffer_size,
+    value_levels=Levels(["constraints", "fx"])
+)
+```
+
+## Examples
+
+### Curiosity applied on [Himmelblau's function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
 
 <div align="center">
   <table>
@@ -61,6 +72,27 @@ python examples/testfunctions/example_gif.py
 </div>
 
 <p align="center"><em>Comparison showing how curiosity loss helps discover all four minima but also taking more iterations</em></p>
+
+### Curiosity applied on [Mishra's Bird function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <img src="./assets/example_misrha_constraint.gif" alt="With Constraints" width="400" />
+        <br>
+        <em>With Constraints</em>
+      </td>
+      <td align="center">
+        <img src="./assets/example_misrha_no_constraint.gif" alt="Without Constraints" width="400" />
+        <br>
+        <em>Without Constraints</em>
+      </td>
+    </tr>
+  </table>
+</div>
+
+<p align="center"><em>Comparison show how adding constraints effect the optimization</em></p>
 
 ---
 

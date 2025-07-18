@@ -34,7 +34,9 @@ class DefaultOpt(BaseOpt):
         x = self.gan.G(x)
 
         # panalize lack of curiousity
-        loss_curiosity = self.gan.curiosity_loss(x)
+        loss_curiosity = 0.0
+        if self.gan.curiosity_loss:
+            loss_curiosity = self.gan.curiosity_loss(x)
 
         # get disciminator output
         outG = self.gan.D(x)
