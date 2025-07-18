@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 from torch import nn
-from .buffer import BufferBase
+from .buffer import Buffer
 from .utils import cross_similarity_loss
 from .utils import self_similarity_loss
 from .utils import cross_siglip
@@ -17,7 +17,7 @@ class CuriosityLossBase(nn.Module):
     def __init__(
         self,
         config: CuriosityLossBaseConfig,
-        buffer: BufferBase | None = None,
+        buffer: Buffer | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -42,7 +42,7 @@ class CuriosityLoss(CuriosityLossBase):
     """Loss is based on CLIP loss"""
 
     def __init__(
-        self, config: CuriosityLossConfig, buffer: BufferBase | None = None, **kwargs
+        self, config: CuriosityLossConfig, buffer: Buffer | None = None, **kwargs
     ) -> None:
         super().__init__(config, buffer)
         self.config = config
@@ -50,7 +50,7 @@ class CuriosityLoss(CuriosityLossBase):
             raise ValueError(
                 "Cross similarity loss is configured to be calculated, but buffer is not passed. Cross similarity is calculated between generator output and top K samples from the buffer"
             )
-        self.buffer: BufferBase | None = buffer
+        self.buffer: Buffer | None = buffer
 
     def forward(self, G_out: torch.Tensor) -> torch.Tensor:
         bs = G_out.size(0)

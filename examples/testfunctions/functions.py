@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Iterable, Optional, List
 
 
 @dataclass
@@ -24,7 +24,7 @@ class TestFunctionBase(ABC):
         self.known_minima: Optional[List[torch.Tensor]] = None
 
     @abstractmethod
-    def f(self, x: torch.Tensor) -> torch.Tensor | Dict[str, torch.Tensor]:
+    def f(self, x: torch.Tensor) -> torch.Tensor | List[torch.Tensor]:
         """
         Evaluate function on input tensor.
         Input: (..., input_dim) - any batch dimensions + feature dimension
@@ -32,9 +32,13 @@ class TestFunctionBase(ABC):
         """
         pass
 
-    def __call__(self, x: torch.Tensor) -> List[float]:
+    def __call__(self, x: torch.Tensor) -> List[float] | List[List[float]]:
         result = self.f(x)
-        return result.detach().cpu().numpy().tolist()
+        if isinstance(result, Iterable):
+            result = [r.detach().cpu().numpy().tolist() for r in result]
+        else:
+            result = result.detach().cpu().numpy().tolist()
+        return result
 
     def _validate_and_project(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.input_dim:
@@ -207,25 +211,26 @@ class ThreeHumpCamelFunction(TestFunctionBase):
 
 
 class MishrasBirdFunctionConstraint(TestFunctionBase):
-    def __init__(self):
+    def __init__(self, return_constraints: bool = True):
         super().__init__(input_dim=2)
-        self.set_domain(lower=torch.tensor([-10, -6.5]), upper=torch.tensor([5, 5]))
+        self.return_constraints = return_constraints
+        self.set_domain(lower=torch.tensor([-12, -12]), upper=torch.tensor([5, 5]))
         self.known_minima = [torch.tensor([-3.1302468, -1.5821422])]
 
     def _get_constraint(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # contraint: (x + 5)**2 + (y + 5)**2 - 25 < 0
-        # we return the how much this constraint is violated
+        # we return the magnitude if how much this constraint is violated
         violation = (x + 5) ** 2 + (y + 5) ** 2 - 25
         return torch.max(torch.zeros(len(x)), violation)
 
-    def f(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def f(self, x: torch.Tensor) -> List[torch.Tensor]:
         x = self._validate_and_project(x)
         x_val = x[..., 0]
         y_val = x[..., 1]
         fx = (
-            torch.sin(y_val) * torch.exp((1 - torch.cos(x_val) ** 2))
+            torch.sin(y_val) * torch.exp((1 - torch.cos(x_val)) ** 2)
             + torch.cos(x_val) * torch.exp((1 - torch.sin(y_val)) ** 2)
             + (x_val - y_val) ** 2
         )
         constraint = self._get_constraint(x_val, y_val)
-        return {"fx": fx, "constraints": constraint}
+        return [constraint, fx] if self.return_constraints else fx

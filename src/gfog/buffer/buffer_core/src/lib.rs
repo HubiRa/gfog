@@ -38,8 +38,9 @@ impl BufferCore {
 
         if self.values.len() == self.max_size {
             let worst_idx = *self.sorted_indices.last().unwrap();
+            // NOTE: vec implements PratialOrder, so we can compare vectors
             if value >= self.values[worst_idx] {
-                return None; // skip worse value
+                return None;
             }
             // Replace worst value at its position (no removal/shifting)
             self.values[worst_idx] = value;
@@ -47,7 +48,7 @@ impl BufferCore {
             return Some(worst_idx);
         }
 
-        // Buffer is growing, add to next position
+        // Buffer is still growing, add to next position
         let position = self.values.len();
         self.values.push(value);
         self.update_sorted_indices();
@@ -55,6 +56,7 @@ impl BufferCore {
     }
 
     pub fn insert_many(&mut self, values: Vec<Vec<f32>>) {
+        // NOTE: for now this is ok but lets check later if theres a better way
         for value in values {
             self.insert(value);
         }
@@ -90,6 +92,13 @@ impl BufferCore {
         } else {
             None
         }
+    }
+
+    pub fn get_sorted_values(&self) -> Vec<Vec<f32>> {
+        self.sorted_indices
+            .iter()
+            .map(|&i| self.values[i].clone())
+            .collect()
     }
 
     fn update_sorted_indices(&mut self) {

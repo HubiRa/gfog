@@ -1,5 +1,4 @@
 import torch
-from tqdm import tqdm
 from .base import BaseOpt
 
 
@@ -57,16 +56,3 @@ class DefaultOpt(BaseOpt):
 
         # add values to buffer
         self.buffer.B.insert_many(values=list(values), tensors=list(x.detach()))
-
-    def optimize(
-        self, n_iter: int, termination_eps: float | None = None
-    ) -> torch.Tensor:
-        for _ in tqdm(range(n_iter)):
-            self.step()
-            if termination_eps is not None:
-                if (
-                    abs(self.buffer.B.values[0] - self.buffer.B.get_mean_buffer_value())
-                    < termination_eps
-                ):
-                    break
-        return self.buffer.get_best_value()

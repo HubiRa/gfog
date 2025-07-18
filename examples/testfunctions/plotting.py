@@ -16,12 +16,12 @@ from tqdm import tqdm
 sns.set_style("darkgrid")
 sns.set_palette("colorblind")
 plt.rcParams["figure.facecolor"] = "#222222"  # Dark grey background
-plt.rcParams["axes.facecolor"] = "#222222"    # Dark grey axes background
-plt.rcParams["text.color"] = "white"          # White text
-plt.rcParams["axes.labelcolor"] = "white"     # White axis labels
-plt.rcParams["xtick.color"] = "white"         # White x-axis ticks
-plt.rcParams["ytick.color"] = "white"         # White y-axis ticks
-plt.rcParams["axes.edgecolor"] = "white"      # White axis borders
+plt.rcParams["axes.facecolor"] = "#222222"  # Dark grey axes background
+plt.rcParams["text.color"] = "white"  # White text
+plt.rcParams["axes.labelcolor"] = "white"  # White axis labels
+plt.rcParams["xtick.color"] = "white"  # White x-axis ticks
+plt.rcParams["ytick.color"] = "white"  # White y-axis ticks
+plt.rcParams["axes.edgecolor"] = "white"  # White axis borders
 
 
 def plot_optimization_gif(
@@ -40,6 +40,10 @@ def plot_optimization_gif(
     max_points: int = 100,
     dpi: int = 80,
     quantize_colors: bool = True,
+    show_constraints: bool = False,
+    constraint_color: str = "#FF6B6B",
+    constraint_alpha: float = 0.7,
+    constraint_linewidth: float = 2.0,
 ) -> None:
     if test_function.input_dim != 2:
         raise ValueError("GIF plotting only supported for 2D functions")
@@ -50,6 +54,8 @@ def plot_optimization_gif(
     X, Y = torch.meshgrid(x_range, y_range, indexing="ij")
     grid_points = torch.stack([X, Y], dim=-1)
     Z = test_function.f(grid_points)
+    if isinstance(Z, List):
+        Z = Z[-1]
 
     # Create better normalization for contour colors
     z_min, z_max = Z.min().item(), Z.max().item()
@@ -89,6 +95,28 @@ def plot_optimization_gif(
         ax.contour(
             X, Y, Z, levels=n_contours, colors="lightgray", alpha=0.6, linewidths=1.0
         )
+
+        # Plot constraints if enabled
+        if show_constraints and hasattr(test_function, "_get_constraint"):
+            # For MishrasBirdFunctionConstraint, draw the circle constraint
+            if hasattr(test_function, "_get_constraint"):
+                # Circle constraint: (x + 5)^2 + (y + 5)^2 - 25 < 0
+                # Center at (-5, -5), radius 5
+                circle_center = (-5, -5)
+                circle_radius = 5
+
+                # Create circle
+                circle = plt.Circle(
+                    circle_center,
+                    circle_radius,
+                    fill=False,
+                    color=constraint_color,
+                    alpha=constraint_alpha,
+                    linewidth=constraint_linewidth,
+                    linestyle="--",
+                    zorder=6,
+                )
+                ax.add_patch(circle)
 
         # Plot known minima
         if (
