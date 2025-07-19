@@ -184,5 +184,7 @@ assets/*
 !assets/example_not_curious.gif
 !assets/example_misrha_constraint.gif
 !assets/example_misrha_no_constraint.gif
+*.vim
+
 
 # End of https://www.toptal.com/developers/gitignore/api/python

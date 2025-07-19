@@ -19,6 +19,9 @@ source .venv/bin/activate
 # Install dependencies
 bash install.sh
 
+# Or, if you want to develop then install as
+bash install.sh dev
+
 # Run example for himmelblau function
 python examples/testfunctions/example_himmelblau.py
 ```
