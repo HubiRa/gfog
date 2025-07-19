@@ -73,7 +73,7 @@ buffer = Buffer(
 
 <p align="center"><em>Comparison showing how curiosity loss helps discover all four minima but also taking more iterations</em></p>
 
-### Curiosity applied on [Mishra's Bird function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
+### Constraints applied on [Mishra's Bird function](https://en.wikipedia.org/wiki/Himmelblau%27s_function)
 
 <div align="center">
   <table>
