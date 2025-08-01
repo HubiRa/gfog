@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Callable, Tuple, Any
 import torch
 from torch import nn
-from ..curiosity import CuriosityLossBase
+from ..curiosity.curiosity import CuriosityLossBase
 
 # from ..buffer.base import BufferBase, Buffer
 from ..buffer import Buffer
