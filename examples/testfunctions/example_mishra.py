@@ -45,7 +45,7 @@ BATCH_SIZE = 64
 
 GAN_DEVICE = torch.device("cpu")
 G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[32]).to(GAN_DEVICE)
-D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[32], spectral_norm=False).to(
+D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[32], use_spectral_norm=False).to(
     GAN_DEVICE
 )
 
