@@ -37,51 +37,54 @@ class BaseOpt(ABC):
 
             self.buffer.B.insert_many(values=values, tensors=list(x.detach()))
 
-        @abstractmethod
-        def step(self) -> None:
-            pass
+    @abstractmethod
+    def propose(self) -> torch.Tensor: ...
 
-        def optimize(
-            self,
-            n_iter: int,
-            termination_eps: float | None = None,
-            verbous: bool = False,
-        ) -> torch.Tensor:
-            def take_step() -> bool:
-                self.step()
-                if termination_eps is not None:
-                    if (
-                        abs(
-                            self.buffer.B.values[0]
-                            - self.buffer.B.get_mean_buffer_value()
-                        )
-                        < termination_eps
-                    ):
-                        return True  # stop
-                return False  # do not stop
+    @abstractmethod
+    def evaluate(self, proposals: torch.Tensor) -> None: ...
 
-            if not verbous:
+    def step(self) -> None:
+        proposals = self.propose()
+        self.evaluate(proposals)
+
+    def optimize(
+        self,
+        n_iter: int,
+        termination_eps: float | None = None,
+        verbous: bool = False,
+    ) -> torch.Tensor:
+        def take_step() -> bool:
+            self.step()
+            if termination_eps is not None:
+                if (
+                    abs(self.buffer.B.values[0] - self.buffer.B.get_mean_buffer_value())
+                    < termination_eps
+                ):
+                    return True  # stop
+            return False  # do not stop
+
+        if not verbous:
+            for _ in range(n_iter):
+                if stop := take_step():
+                    break
+        else:
+            progress = Progress(
+                TextColumn("Iteration {task.completed}"),
+                BarColumn(),
+                TextColumn("Best: {task.fields[best]:.4f}"),
+                TextColumn("Mean: {task.fields[mean]:.4f}"),
+                TimeElapsedColumn(),
+            )
+            with progress:
+                task = progress.add_task(
+                    "Optimizing", total=n_iter, best=999.0, mean=999.0
+                )
                 for _ in range(n_iter):
                     if stop := take_step():
                         break
-            else:
-                progress = Progress(
-                    TextColumn("Iteration {task.completed}"),
-                    BarColumn(),
-                    TextColumn("Best: {task.fields[best]:.4f}"),
-                    TextColumn("Mean: {task.fields[mean]:.4f}"),
-                    TimeElapsedColumn(),
+                progress.update(
+                    task,
+                    advance=1,
+                    best=self.buffer.B.get_value(0, level=-1),
+                    mean=self.buffer.B.get_mean_buffer_value(level=-1),
                 )
-                with progress:
-                    task = progress.add_task(
-                        "Optimizing", total=n_iter, best=999.0, mean=999.0
-                    )
-                    for _ in range(n_iter):
-                        if stop := take_step():
-                            break
-                    progress.update(
-                        task,
-                        advance=1,
-                        best=self.buffer.B.get_value(0, level=-1),
-                        mean=self.buffer.B.get_mean_buffer_value(level=-1),
-                    )

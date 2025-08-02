@@ -3,7 +3,7 @@ from .base import BaseOpt
 
 
 class DefaultOpt(BaseOpt):
-    def step(self) -> None:
+    def propose(self) -> torch.Tensor:
         # zero grad
         self.gan.optimizerG.zero_grad()
         self.gan.optimizerD.zero_grad()
@@ -53,8 +53,11 @@ class DefaultOpt(BaseOpt):
         # update generator
         self.gan.optimizerG.step()
 
+        return x
+
+    def evaluate(self, proposals: torch.Tensor) -> None:
         # function evaluation
-        values = self.fn.f(x.detach().to(self.fn.device, self.fn.dtype))
+        values = self.fn.f(proposals.detach().to(self.fn.device, self.fn.dtype))
 
         # add values to buffer
-        self.buffer.B.insert_many(values=list(values), tensors=list(x.detach()))
+        self.buffer.B.insert_many(values=list(values), tensors=list(proposals.detach()))
