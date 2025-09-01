@@ -6,6 +6,7 @@ from ..utils import cross_similarity_loss
 from ..utils import self_similarity_loss
 from ..utils import cross_siglip
 from ..utils import self_siglip
+from ..utils import uniformity_loss
 
 from .scheduler import Scheduler
 
@@ -108,3 +109,41 @@ class CuriositySiglipLoss(CuriosityLoss):
                 G_out, temperature=self.config.temperature
             )
         return loss
+
+
+@dataclass
+class WangIsolaUniformityConfig(CuriosityLossBaseConfig):
+    t: float = 2.0
+    use_buffer: bool = False
+    weight: float = 1.0
+
+
+class WangIsolaUniformity(CuriosityLossBase):
+    """Dedicated Wang–Isola uniformity curiosity loss.
+
+    Computes log E[exp(-t * ||xi - xj||^2)] on L2‑normalized embeddings. Optionally
+    augments the batch with top‑K items from the buffer.
+    """
+
+    def __init__(
+        self,
+        config: WangIsolaUniformityConfig,
+        buffer: Buffer | None = None,
+        scheduler: Scheduler | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(config, buffer, scheduler)
+        self.config = config
+
+    def forward(self, G_out: torch.Tensor) -> torch.Tensor:
+        bs = G_out.size(0)
+        sched_value = self.scheduler.step() if self.scheduler else 1.0
+        if self.config.use_buffer:
+            if not self.buffer:
+                raise ValueError("use_buffer=True but no buffer provided")
+            x = torch.cat([G_out, self.buffer.get_top_k(bs)], dim=0)
+        else:
+            x = G_out
+        return sched_value * self.config.weight * uniformity_loss(
+            x, t=self.config.t
+        )

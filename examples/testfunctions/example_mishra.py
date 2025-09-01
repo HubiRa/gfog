@@ -1,6 +1,6 @@
 from gfog.curiosity import (
-    CuriositySiglipLoss,
-    CuriositySiglipLossConfig,
+    WangIsolaUniformityConfig,
+    WangIsolaUniformity,
 )
 import torch
 
@@ -60,8 +60,8 @@ gan = components.GAN(
     G=G,
     D=D,
     loss=BCEWithLogitsLoss(),
-    curiosity_loss=CuriositySiglipLoss(
-        config=CuriositySiglipLossConfig(calc_self_sim=100.0, calc_cross_sim=100.0),
+    curiosity_loss=WangIsolaUniformity(
+        config=WangIsolaUniformityConfig(use_buffer=True, weight=10),
         buffer=buffer.B,
     ),
     latent_dim=LATENT_DIM,

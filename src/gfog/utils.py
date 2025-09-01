@@ -54,3 +54,19 @@ def self_siglip(x: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     loss = F.logsigmoid(labels * logits)
 
     return -loss.mean()
+
+
+def uniformity_loss(x: torch.Tensor, t: float = 2.0, eps: float = 1e-8) -> torch.Tensor:
+    """Wang–Isola uniformity loss on the hypersphere.
+
+    Computes log E[exp(-t * ||xi - xj||^2)] over pairwise pairs in the batch.
+    Returns 0 when batch has fewer than 2 samples.
+    """
+    if x.size(0) < 2:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+    nx = F.normalize(x, dim=-1)
+    sq_dists = torch.pdist(nx, p=2).pow(2)
+    z = -t * sq_dists
+    return torch.logsumexp(z, dim=0) - torch.log(
+        torch.tensor(z.numel(), device=z.device, dtype=z.dtype)
+    )

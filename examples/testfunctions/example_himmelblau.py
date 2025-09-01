@@ -1,6 +1,6 @@
 from gfog.curiosity import (
-    CuriositySiglipLoss,
-    CuriositySiglipLossConfig,
+    WangIsolaUniformityConfig,
+    WangIsolaUniformity,
 )
 import torch
 
@@ -45,9 +45,7 @@ BATCH_SIZE = 64
 
 GAN_DEVICE = torch.device("cpu")
 G = MLP(input_dim=LATENT_DIM, output_dim=F_DIM, hidden_dims=[32]).to(GAN_DEVICE)
-D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[32], spectral_norm=False).to(
-    GAN_DEVICE
-)
+D = MLP(input_dim=F_DIM, output_dim=1, hidden_dims=[32]).to(GAN_DEVICE)
 
 
 buffer = components.BufferComp(B=Buffer(buffer_size=2 * BATCH_SIZE))
@@ -58,8 +56,8 @@ gan = components.GAN(
     G=G,
     D=D,
     loss=BCEWithLogitsLoss(),
-    curiosity_loss=CuriositySiglipLoss(
-        config=CuriositySiglipLossConfig(calc_self_sim=200.0, calc_cross_sim=200.0),
+    curiosity_loss=WangIsolaUniformity(
+        config=WangIsolaUniformityConfig(use_buffer=True, weight=100),
         buffer=buffer.B,
     ),
     latent_dim=LATENT_DIM,
