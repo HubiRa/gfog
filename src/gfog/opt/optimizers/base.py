@@ -82,9 +82,9 @@ class BaseOpt(ABC):
                 for _ in range(n_iter):
                     if stop := take_step():
                         break
-                progress.update(
-                    task,
-                    advance=1,
-                    best=self.buffer.B.get_value(0, level=-1),
-                    mean=self.buffer.B.get_mean_buffer_value(level=-1),
-                )
+                    progress.update(
+                        task,
+                        advance=1,
+                        best=self.buffer.B.get_value(0, level=-1),
+                        mean=self.buffer.B.get_mean_buffer_value(level=-1),
+                    )
