@@ -17,7 +17,7 @@ from loguru import logger
 # --------------------------------------
 # Cart pole example
 # --------------------------------------
-env = gym.make("CartPole-v1")
+env = gym.make("CartPole-v1", max_episode_steps=5000)
 
 
 def eval_policy(theta, runs_per_env: int = 5):
