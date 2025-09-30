@@ -1,5 +1,5 @@
 import torch
-from typing import Iterable
+from typing import Iterable, TypedDict
 
 from loguru import logger
 from abc import ABC, abstractmethod
@@ -7,6 +7,11 @@ from rich.progress import track
 
 from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn
 from ..components import OptComponents
+
+
+class PrintTableOptions(TypedDict):
+    print_table_every_n_steps: int
+    k_best: int
 
 
 class BaseOpt(ABC):
@@ -52,6 +57,7 @@ class BaseOpt(ABC):
         n_iter: int,
         termination_eps: float | None = None,
         verbous: bool = False,
+        print_table_options: PrintTableOptions | None = None,
     ) -> torch.Tensor:
         def take_step() -> bool:
             self.step()
@@ -79,7 +85,7 @@ class BaseOpt(ABC):
                 task = progress.add_task(
                     "Optimizing", total=n_iter, best=999.0, mean=999.0
                 )
-                for _ in range(n_iter):
+                for i in range(n_iter):
                     if stop := take_step():
                         break
                     progress.update(
@@ -88,3 +94,10 @@ class BaseOpt(ABC):
                         best=self.buffer.B.get_value(0, level=-1),
                         mean=self.buffer.B.get_mean_buffer_value(level=-1),
                     )
+
+                    if print_table_options and (
+                        n := print_table_options.get("print_table_every_n_steps", 0) > 0
+                    ):
+                        if i % n == 0:
+                            k = print_table_options.get("k_best", 3)
+                            self.buffer.B.print_values(slice(0, k, 1))

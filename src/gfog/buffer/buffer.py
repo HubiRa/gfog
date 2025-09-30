@@ -1,7 +1,8 @@
-from typing import List, Sequence, Iterable
+from typing import Iterable, List
 from torch import Tensor
 import torch
 from random import sample
+from .levels import Levels
 
 try:
     from buffer_core import BufferCore
@@ -10,46 +11,6 @@ except ImportError:
         "Warning: buffer_core not available. Run 'maturin develop' to build the Rust extension."
     )
     raise
-
-
-class Levels:
-    def __init__(self, spec: int | Sequence[str]):
-        if isinstance(spec, int):
-            if spec < 1:
-                raise ValueError("Number of levels must be >= 1")
-            self._names = [f"L{i}" for i in range(spec)]
-        elif isinstance(spec, Sequence) and all(isinstance(s, str) for s in spec):
-            if len(set(spec)) != len(spec):
-                raise ValueError("Level names must be unique")
-            self._names = list(spec)
-        else:
-            raise TypeError(
-                "Levels must be initialized with an int or a sequence of strings"
-            )
-
-        self._name_to_index = {name: idx for idx, name in enumerate(self._names)}
-
-    def __getitem__(self, key: int | str) -> str | int:
-        if isinstance(key, int):
-            return self._names[key]
-        elif isinstance(key, str):
-            return self._name_to_index[key]
-        raise TypeError("Key must be int or str")
-
-    def num_levels(self) -> int:
-        return len(self._names)
-
-    def __len__(self) -> int:
-        return len(self._names)
-
-    def index(self, name: str) -> int:
-        return self._name_to_index[name]
-
-    def names(self) -> list[str]:
-        return self._names.copy()
-
-    def __repr__(self) -> str:
-        return f"Levels({self._names})"
 
 
 class Buffer:
@@ -104,20 +65,7 @@ class Buffer:
             )
 
     def insert(self, tensor: Tensor, value: float | Iterable[float]) -> None:
-        num_levels = self.value_levels.num_levels()
-
-        if isinstance(value, (int, float)):
-            if num_levels != 1:
-                raise ValueError(
-                    f"Single value provided but buffer has {num_levels} levels"
-                )
-            value_vec = [float(value)]
-        else:
-            value_vec = list(map(float, value))
-            if len(value_vec) != num_levels:
-                raise ValueError(
-                    f"Value vector length {len(value_vec)} != {num_levels}"
-                )
+        value_vec = self.value_levels.expand_input(value)
 
         self._maybe_init_tensor_buffer(tensor)
 

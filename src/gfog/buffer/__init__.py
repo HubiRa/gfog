@@ -1,4 +1,4 @@
 from .buffer import Buffer
-from .buffer import Levels
+from .levels import Levels, Rung
 
-__all__ = ["Buffer", "Levels"]
+__all__ = ["Buffer", "Levels", "Rung"]
