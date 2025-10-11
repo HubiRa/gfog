@@ -144,6 +144,4 @@ class WangIsolaUniformity(CuriosityLossBase):
             x = torch.cat([G_out, self.buffer.get_top_k(bs)], dim=0)
         else:
             x = G_out
-        return sched_value * self.config.weight * uniformity_loss(
-            x, t=self.config.t
-        )
+        return sched_value * self.config.weight * uniformity_loss(x, t=self.config.t)
