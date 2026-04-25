@@ -999,8 +999,248 @@ class TopologySpaceUniformity(torch.nn.Module):
         return sched_value * self.weight * uniformity_loss(decoded, t=self.t)
 
 
+def lexicographic_order(values: list[list[float]]) -> list[int]:
+    return sorted(range(len(values)), key=lambda idx: tuple(values[idx]))
+
+
+def plackett_luce_loss(scores_best_to_worst: torch.Tensor) -> torch.Tensor:
+    scores = scores_best_to_worst.reshape(-1)
+    if scores.numel() < 2:
+        return torch.zeros((), device=scores.device, dtype=scores.dtype)
+    log_denoms = torch.logcumsumexp(scores.flip(0), dim=0).flip(0)
+    return -(scores - log_denoms).mean()
+
+
+class EvaluatedArchive:
+    """Replay archive containing all evaluated tensors and objective values."""
+
+    def __init__(self, max_size: int | None = None) -> None:
+        self.max_size = max_size
+        self.tensors: list[torch.Tensor] = []
+        self.values: list[list[float]] = []
+
+    def add_many(self, tensors: torch.Tensor, values: list[list[float]]) -> None:
+        for tensor, value in zip(tensors.detach().cpu(), values, strict=True):
+            self.tensors.append(tensor.clone())
+            self.values.append([float(v) for v in value])
+        if self.max_size is not None and len(self.tensors) > self.max_size:
+            excess = len(self.tensors) - self.max_size
+            del self.tensors[:excess]
+            del self.values[:excess]
+
+    def __len__(self) -> int:
+        return len(self.tensors)
+
+    def sample_ranked(
+        self,
+        k: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if len(self.tensors) == 0:
+            raise RuntimeError("Cannot sample from an empty evaluated archive")
+        k = min(k, len(self.tensors))
+        idx = torch.randperm(len(self.tensors))[:k].tolist()
+        ranked_idx = sorted(idx, key=lambda i: tuple(self.values[i]))
+        return torch.stack([self.tensors[i] for i in ranked_idx]).to(device, dtype)
+
+
+class PlackettLuceRankerOpt(BaseOpt):
+    """GFog variant that trains D as a listwise ranker over evaluated samples."""
+
+    def __init__(
+        self,
+        components: components.OptComponents,
+        *,
+        archive_size: int | None = None,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        generator_elite_margin: bool = False,
+    ) -> None:
+        self.archive = EvaluatedArchive(max_size=archive_size)
+        self.ranker_list_size = ranker_list_size
+        self.ranker_steps = ranker_steps
+        self.generator_elite_margin = generator_elite_margin
+        super().__init__(components)
+
+    def evaluate(self, proposals: torch.Tensor) -> None:
+        values = self.fn.f(proposals.detach().to(self.fn.device, self.fn.dtype))
+        value_list = [list(v) for v in values]
+        detached = proposals.detach()
+        self.buffer.B.insert_many(values=value_list, tensors=list(detached))
+        self.archive.add_many(detached, value_list)
+
+    def _train_ranker_step(self) -> None:
+        if len(self.archive) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+        ranked = self.archive.sample_ranked(
+            self.ranker_list_size,
+            device=self.gan.device,
+            dtype=self.gan.dtype,
+        )
+        scores = self.gan.D(ranked).reshape(-1)
+        loss = plackett_luce_loss(scores)
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self.gan.G(z)
+        scores = self.gan.D(proposals).reshape(-1)
+        loss_g = -scores.mean()
+        if self.generator_elite_margin and len(self.buffer.B) > 0:
+            elite = self.buffer.B.get_top_k(
+                min(proposals.shape[0], len(self.buffer.B))
+            ).to(self.gan.device, self.gan.dtype)
+            elite_scores = self.gan.D(elite).reshape(-1).detach()
+            loss_g = F.softplus(-(scores[: elite_scores.numel()] - elite_scores)).mean()
+        loss = loss_g
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return proposals
+
+
+class BufferPlackettLuceRankerOpt(BaseOpt):
+    """Listwise ranker optimizer using only the current elite buffer."""
+
+    def __init__(
+        self,
+        components: components.OptComponents,
+        *,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        generator_elite_margin: bool = False,
+    ) -> None:
+        self.ranker_list_size = ranker_list_size
+        self.ranker_steps = ranker_steps
+        self.generator_elite_margin = generator_elite_margin
+        super().__init__(components)
+
+    def _ranked_buffer_subset(self, k: int) -> torch.Tensor:
+        current_len = len(self.buffer.B)
+        if current_len == 0:
+            raise RuntimeError("Cannot sample from an empty buffer")
+        k = min(k, current_len)
+        if k == current_len:
+            ranked = self.buffer.B.get_top_k(k)
+        else:
+            # Buffer indices are already sorted best-to-worst, so sampled sorted
+            # positions preserve the true lexicographic order.
+            positions = torch.randperm(current_len)[:k].sort().values.tolist()
+            ranked = torch.stack([self.buffer.B.get(int(pos)) for pos in positions])
+        return ranked.to(self.gan.device, self.gan.dtype)
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+        ranked = self._ranked_buffer_subset(self.ranker_list_size)
+        scores = self.gan.D(ranked).reshape(-1)
+        loss = plackett_luce_loss(scores)
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self.gan.G(z)
+        scores = self.gan.D(proposals).reshape(-1)
+        if self.generator_elite_margin:
+            elite = self._ranked_buffer_subset(
+                min(proposals.shape[0], len(self.buffer.B))
+            )
+            elite_scores = self.gan.D(elite).reshape(-1).detach()
+            loss_g = F.softplus(-(scores[: elite_scores.numel()] - elite_scores)).mean()
+        else:
+            loss_g = -scores.mean()
+        loss = loss_g
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return proposals
+
+    def evaluate(self, proposals: torch.Tensor) -> None:
+        values = self.fn.f(proposals.detach().to(self.fn.device, self.fn.dtype))
+        self.buffer.B.insert_many(values=list(values), tensors=list(proposals.detach()))
+
+
+class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
+    """LSGAN with an additional Plackett-Luce ranking loss on buffer elites."""
+
+    def __init__(
+        self,
+        opt_components: components.OptComponents,
+        *,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        ranker_weight: float = 0.1,
+    ) -> None:
+        super().__init__(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=False,
+        )
+        if ranker_weight < 0:
+            raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
+        self.ranker_weight = ranker_weight
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+
+        ranked = self._ranked_buffer_subset(self.ranker_list_size)
+        real_scores = self.gan.D(ranked).reshape(-1)
+        rank_loss = plackett_luce_loss(real_scores)
+
+        with torch.no_grad():
+            z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+            fake = self.gan.G(z)
+        fake_scores = self.gan.D(fake.detach())
+        fake_loss = 0.5 * (fake_scores**2).mean()
+
+        loss = fake_loss + self.ranker_weight * rank_loss
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self.gan.G(z)
+        scores = self.gan.D(proposals)
+        loss = 0.5 * ((scores - 1.0) ** 2).mean()
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return proposals
+
+
 def make_optimizer(
-    optimizer_type: str, opt_components: components.OptComponents
+    optimizer_type: str,
+    opt_components: components.OptComponents,
+    *,
+    archive_size: int | None = None,
+    ranker_list_size: int = 32,
+    ranker_steps: int = 1,
+    ranker_generator_elite_margin: bool = False,
+    ranker_weight: float = 0.1,
 ) -> BaseOpt:
     if optimizer_type == "default":
         return DefaultOpt(opt_components)
@@ -1012,6 +1252,28 @@ def make_optimizer(
         return WGANOpt(opt_components)
     if optimizer_type == "wgangp":
         return WGANGPOpt(opt_components)
+    if optimizer_type == "plackett_luce":
+        return PlackettLuceRankerOpt(
+            opt_components,
+            archive_size=archive_size,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=ranker_generator_elite_margin,
+        )
+    if optimizer_type == "buffer_plackett_luce":
+        return BufferPlackettLuceRankerOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=ranker_generator_elite_margin,
+        )
+    if optimizer_type == "ranked_lsgan":
+        return RankedLSGANOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            ranker_weight=ranker_weight,
+        )
     raise ValueError(f"Unknown optimizer_type: {optimizer_type}")
 
 
@@ -1226,8 +1488,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--optimizer_type",
-        choices=["default", "hinge", "lsgan", "wgan", "wgangp"],
+        choices=[
+            "default",
+            "hinge",
+            "lsgan",
+            "wgan",
+            "wgangp",
+            "plackett_luce",
+            "buffer_plackett_luce",
+            "ranked_lsgan",
+        ],
         default="default",
+    )
+    parser.add_argument("--ranker_list_size", type=int, default=32)
+    parser.add_argument("--ranker_steps", type=int, default=1)
+    parser.add_argument("--ranker_archive_size", type=int, default=8192)
+    parser.add_argument("--ranker_generator_elite_margin", action="store_true")
+    parser.add_argument(
+        "--ranker_weight",
+        type=float,
+        default=0.1,
+        help="Weight for auxiliary PL rank loss in ranked_lsgan.",
     )
     parser.add_argument(
         "--g_torch_optimizer",
@@ -1459,18 +1740,30 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         gradient_penalty_weight=args.gradient_penalty_weight,
     )
     if args.train_on_decoded:
+        if args.optimizer_type == "plackett_luce":
+            raise ValueError(
+                "--optimizer_type plackett_luce does not support --train_on_decoded yet"
+            )
         optimizer = make_decoded_density_optimizer(
             args.optimizer_type,
             opt_components,
             evaluator=evaluator,
         )
     else:
-        optimizer = make_optimizer(args.optimizer_type, opt_components)
+        optimizer = make_optimizer(
+            args.optimizer_type,
+            opt_components,
+            archive_size=args.ranker_archive_size,
+            ranker_list_size=args.ranker_list_size,
+            ranker_steps=args.ranker_steps,
+            ranker_generator_elite_margin=args.ranker_generator_elite_margin,
+            ranker_weight=args.ranker_weight,
+        )
 
     logger.info(
         f"FEMCantilever: grid={args.grid_width}x{args.grid_height} code_grid={code_width}x{code_height} backend={args.backend} encoding={args.encoding} optimizer={args.optimizer_type} n_iter={args.n_iter} "
         f"G={args.generator_type} D={args.discriminator_type} "
-        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_schedule={args.curiosity_schedule} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} filter_radius={args.density_filter_radius} residual_scale={args.residual_scale} "
+        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_schedule={args.curiosity_schedule} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} ranker_list_size={args.ranker_list_size} ranker_steps={args.ranker_steps} ranker_weight={args.ranker_weight} filter_radius={args.density_filter_radius} residual_scale={args.residual_scale} "
         f"projection_beta={args.projection_beta} hard_binarize={args.hard_binarize} train_on_decoded={args.train_on_decoded}"
     )
     optimizer.optimize(args.n_iter, verbose=True)
@@ -1565,6 +1858,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         ),
         train_on_decoded=np.asarray([args.train_on_decoded], dtype=np.int32),
         optimizer_type=np.asarray([args.optimizer_type]),
+        ranker_list_size=np.asarray([args.ranker_list_size], dtype=np.int32),
+        ranker_steps=np.asarray([args.ranker_steps], dtype=np.int32),
+        ranker_archive_size=np.asarray([args.ranker_archive_size], dtype=np.int32),
+        ranker_generator_elite_margin=np.asarray(
+            [args.ranker_generator_elite_margin], dtype=np.int32
+        ),
+        ranker_weight=np.asarray([args.ranker_weight], dtype=np.float32),
         buffer_multiplier=np.asarray([args.buffer_multiplier], dtype=np.int32),
         density_filter_radius=np.asarray([args.density_filter_radius], dtype=np.int32),
         projection_beta=np.asarray([args.projection_beta], dtype=np.float32),

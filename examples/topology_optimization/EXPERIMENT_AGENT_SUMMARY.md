@@ -52,6 +52,18 @@ Artifact:
 results/fem_cantilever_topkvolume_lsgan_iter3000_convG_mlpD_topocuriosity0p1_sched_gmuon0p03_dmuon0p03_seed0/top_designs_curiosity_0.1_seed_0.npz
 ```
 
+Recommended next Spark baseline:
+
+```text
+Conv G + MLP D, LSGAN, Muon/Muon, scheduled topology curiosity
+n_iter: 10000 or 20000
+batch_size: 1024
+buffer_multiplier: 16
+effective elite buffer size: 16384
+```
+
+This keeps the current best learning setup and spends the larger machine budget on a much larger elite buffer without making each iteration too expensive. The 40x20 topology tensors are small; the likely limiter is FEM evaluation wall-clock, not buffer memory. Increase `BATCH_SIZE` to `2048` or `4096` only after measuring iteration time.
+
 ## Important Code Changes
 
 Main file:
@@ -71,12 +83,22 @@ Added:
 - `--curiosity_schedule none|warmup_cosine`.
 - `ConvDecoderGenerator`, enabled with `--generator_type conv`.
 - `ConvDiscriminator`, enabled with `--discriminator_type conv`.
+- Plackett-Luce/listwise ranker experiments:
+  - `--optimizer_type plackett_luce`
+  - `--optimizer_type buffer_plackett_luce`
+  - `--optimizer_type ranked_lsgan`
+  - `--ranker_list_size`
+  - `--ranker_steps`
+  - `--ranker_weight`
 - Network metadata saved into `.npz` artifacts.
 
 Also added:
 
 ```text
 examples/topology_optimization/run_overnight_topopt.sh
+examples/topology_optimization/run_topopt_best_local.sh
+examples/topology_optimization/run_topopt_ranker_sweep.sh
+examples/topology_optimization/run_spark_best_topopt.sh
 ```
 
 ## Key Experimental Results
@@ -94,6 +116,22 @@ Conv G + MLP D, Muon/Muon, topk_volume, 3000 iters:      100.5034
 Conv G + MLP D, Muon/Muon, topk_volume, 10000 iters:      96.2709
 Conv G + MLP D, scheduled topology curiosity, 3000 iters: 96.1404
 ```
+
+Ranking/ranker experiments:
+
+```text
+Archive Plackett-Luce, naive G=-D(G), 1000 iters:                    447.6559
+Archive Plackett-Luce, elite-margin G, 1000 iters:                   118.4872
+Archive Plackett-Luce, elite-margin G, 3000 iters:                   111.0036
+Buffer-only Plackett-Luce, ranker_steps=3, 1000 iters:               388.2138
+Buffer-only Plackett-Luce, ranker_steps=1, d_lr=0.1, 1000 iters:     377.8967
+Ranked LSGAN, implicit ranker_weight=1.0, 1000 iters:                183.1135
+Ranked LSGAN, implicit ranker_weight=1.0, 3000 iters:                183.1135
+Ranked LSGAN + topology curiosity, 1000 iters:                       448.9517
+Ranked LSGAN, auxiliary ranker_weight=0.1, 1000 iters:               193.9727
+```
+
+Interpretation: listwise ranking is interesting conceptually, but the current implementations are not competitive with LSGAN. The best ranker result was archive Plackett-Luce with elite-margin G at `111.0036`, still behind Conv G LSGAN. Curiosity made ranked LSGAN much worse by increasing diversity without usable compliance pressure. Do not prioritize rankers for large Spark runs unless testing a new loss shape.
 
 Larger batch and larger G before Conv G:
 
@@ -220,7 +258,9 @@ latent_dim: 64, 128
 
 ```text
 batch_size: 64, 128, 256
-buffer_multiplier: 2, 4
+large-machine batch_size: 1024, 2048, 4096
+buffer_multiplier: 2, 4, 8
+Spark first shot: batch_size=1024, buffer_multiplier=16, buffer size=16384
 ```
 
 5. Geometry/mesh scale once robust:
@@ -230,6 +270,31 @@ grid: 60x30, 80x40
 ```
 
 Keep `D=MLP` initially. The first Conv D test was poor and slow.
+
+## Launch Scripts
+
+Use these from the repo root:
+
+```bash
+bash examples/topology_optimization/run_topopt_best_local.sh
+bash examples/topology_optimization/run_topopt_ranker_sweep.sh
+bash examples/topology_optimization/run_spark_best_topopt.sh
+```
+
+The Spark script is parameterized through environment variables:
+
+```bash
+N_ITER=20000 BATCH_SIZE=1024 BUFFER_MULTIPLIER=16 SEED=0 \
+  bash examples/topology_optimization/run_spark_best_topopt.sh
+```
+
+Default Spark config is the current best learning setup:
+
+```text
+topk_volume + LSGAN + Conv G + MLP D + Muon/Muon + scheduled topology curiosity
+curiosity=0.1, warmup_cosine, warmup_frac=0.05
+generator_channels=64, latent_dim=64
+```
 
 ## Caveats
 
