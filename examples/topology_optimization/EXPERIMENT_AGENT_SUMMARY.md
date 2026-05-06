@@ -4,7 +4,10 @@ This summarizes the topology-optimization work so the next agent can continue on
 
 ## Current Best Direction
 
-The strongest setup so far is now:
+There are two different benchmarks in this repo now. Do not mix the absolute
+compliance numbers.
+
+Current learning setup that worked best:
 
 - `encoding=topk_volume`
 - `optimizer_type=quantile_ranked_default`
@@ -19,7 +22,12 @@ The strongest setup so far is now:
 - `g_lr=0.03`
 - `d_lr=0.03`
 - `curiosity=0`
+
+Old 40x20 toy benchmark setting:
+
 - `grid=40x20`
+- `single center-right point load`
+- `E=1`
 - `volume_max=0.48`
 - `density_filter_radius=1`
 - `projection_beta=1`
@@ -38,6 +46,33 @@ Artifact:
 
 ```text
 results/fem_cantilever_topkvolume_quantile_ranked_default_exp4_w1_iter10000_convG_mlpD_bufx8_pool128_seed0/top_designs_curiosity_0_seed_0.npz
+```
+
+Current TOM/GiNN-scale benchmark setting:
+
+- `--preset tom_cantilever_2d`
+- `grid=150x100`
+- `domain=1.5x1.0`
+- `E=196`
+- two distributed right-edge traction patches
+- `volume_max=0.48`
+- `density_filter_radius=0`
+- `solid_compliance=0.0038145905`
+
+Best completed TOM/GiNN-scale result:
+
+```text
+Quantile-ranked vanilla GAN, exp tau=4, buffer=512, sample pool=128, 3k iters, seed 0, fem_workers=8
+best_feasible_compliance = 0.0447193
+mean_top9                = 0.0617
+relative best            = 11.7232
+runtime                  = 3:29:53 on local CPU
+```
+
+Artifact:
+
+```text
+results/fem_cantilever_tom_preset_quantile_tau4_iter3000_workers8_seed0/top_designs_curiosity_0_seed_0.npz
 ```
 
 Previous strongest LSGAN results:
@@ -62,7 +97,51 @@ Artifact:
 results/fem_cantilever_topkvolume_lsgan_iter3000_convG_mlpD_topocuriosity0p1_sched_gmuon0p03_dmuon0p03_seed0/top_designs_curiosity_0.1_seed_0.npz
 ```
 
-Recommended next Spark baseline:
+Recommended next Spark/DGX baseline for TOM/GiNN-scale comparison:
+
+```text
+Use --preset tom_cantilever_2d.
+Start with batch_size=64, buffer_multiplier=8, ranker_sample_pool_size=128.
+Use fem_workers=8 initially, then test 16/24/32 depending on CPU cores and memory.
+Run n_iter=10000 first; 20000 only if the 10k curve is still improving.
+```
+
+Do not start TOM/GiNN-scale runs with `batch_size=1024`, `buffer_multiplier=16`.
+That recommendation was for the old 40x20 toy benchmark. On the 150x100 TOM
+preset it creates very expensive high-resolution sparse FEM batches.
+
+Recommended command:
+
+```bash
+python examples/topology_optimization/cantilever_fem.py \
+  --preset tom_cantilever_2d \
+  --n_iter 10000 --batch_size 64 --buffer_multiplier 8 \
+  --latent_dim 64 \
+  --encoding topk_volume \
+  --optimizer_type quantile_ranked_default \
+  --ranker_list_size 64 \
+  --ranker_steps 1 \
+  --ranker_sample_pool_size 128 \
+  --ranker_sample_mode random_top_pool \
+  --ranker_weight 1.0 \
+  --ranker_target_curve exp \
+  --ranker_target_scope local \
+  --ranker_tau 4 \
+  --curiosity 0 \
+  --projection_beta 1 \
+  --fem_workers 8 \
+  --seed 0 \
+  --g_torch_optimizer muon \
+  --d_torch_optimizer muon \
+  --g_lr 0.03 --d_lr 0.03 \
+  --generator_type conv \
+  --discriminator_type mlp \
+  --generator_channels 64 \
+  --discriminator_hidden_dims 128 128 \
+  --output_dir results/fem_cantilever_tom_preset_quantile_tau4_iter10000_workers8_seed0
+```
+
+Old 40x20 Spark baseline, only if intentionally continuing the toy benchmark:
 
 ```text
 Conv G + MLP D, quantile-ranked vanilla GAN, exp tau=4, top-tail ranker pool, Muon/Muon
@@ -73,7 +152,9 @@ ranker_sample_pool_size: 2048 initially
 effective elite buffer size: 16384
 ```
 
-This keeps the current best learning setup and spends the larger machine budget on a much larger elite buffer without making each iteration too expensive. The 40x20 topology tensors are small; the likely limiter is FEM evaluation wall-clock, not buffer memory. Increase `BATCH_SIZE` to `2048` or `4096` only after measuring iteration time.
+This old recommendation keeps the best learning setup and spends the larger
+machine budget on a much larger elite buffer. It is only reasonable because the
+40x20 topology tensors and FEM solves are small.
 
 ## Important Code Changes
 
@@ -492,42 +573,49 @@ python examples/topology_optimization/cantilever_fem.py \
 
 Prioritize these on the NVIDIA machine:
 
-1. Seed sweep for the best scheduled-curiosity Conv G config:
+1. TOM/GiNN-scale continuation:
+
+```text
+baseline: --preset tom_cantilever_2d
+n_iter: 10000 first, then 20000 only if still improving
+batch_size: 64 initially
+buffer_multiplier: 8
+ranker_sample_pool_size: 128
+fem_workers: 8 initially; test 16, 24, 32
+```
+
+2. TOM/GiNN-scale worker and batch throughput:
+
+```text
+Keep the learning setup fixed and measure wall-clock per 100 iterations.
+Try fem_workers: 8, 16, 24, 32
+Then try batch_size: 128, 256 only if memory and sparse-solve throughput are stable.
+Do not jump to batch_size=1024 on the TOM preset until measured.
+```
+
+3. TOM/GiNN-scale ranker pool after batch changes:
+
+```text
+batch_size=64: ranker_sample_pool_size=128
+batch_size=128: ranker_sample_pool_size=256
+batch_size=256: ranker_sample_pool_size=512
+Keep ranker_list_size=64 initially.
+```
+
+4. Seed sweep after a stable TOM/GiNN setting:
 
 ```text
 seeds: 0, 1, 2, 3, 4
 n_iter: 3000 and 10000
+Only do this after checking the 10k learning curve.
 ```
 
-2. Longer scheduled-curiosity Conv G:
+5. Old 40x20 toy benchmark, only if intentionally continuing that benchmark:
 
 ```text
-n_iter: 10000, 20000
-curiosity: 0.05, 0.1, 0.2
-curiosity_schedule: warmup_cosine
-warmup_frac: 0.02, 0.05, 0.1
-```
-
-3. Conv G capacity:
-
-```text
-generator_channels: 64, 96, 128
-latent_dim: 64, 128
-```
-
-4. Batch/buffer:
-
-```text
-batch_size: 64, 128, 256
-large-machine batch_size: 1024, 2048, 4096
-buffer_multiplier: 2, 4, 8
-Spark first shot: batch_size=1024, buffer_multiplier=16, buffer size=16384
-```
-
-5. Geometry/mesh scale once robust:
-
-```text
-grid: 60x30, 80x40
+batch_size: 1024, 2048, 4096
+buffer_multiplier: 16
+ranker_sample_pool_size: 2048 initially
 ```
 
 Keep `D=MLP` initially. The first Conv D test was poor and slow.
@@ -604,6 +692,10 @@ bash examples/topology_optimization/run_topopt_ranker_sweep.sh
 bash examples/topology_optimization/run_spark_best_topopt.sh
 ```
 
+Warning: `run_spark_best_topopt.sh` was written for the old 40x20 small-grid
+benchmark unless it has been updated on the target machine. For TOM/GiNN-scale
+runs, prefer the explicit `--preset tom_cantilever_2d` command above.
+
 The Spark script is parameterized through environment variables:
 
 ```bash
@@ -611,7 +703,7 @@ N_ITER=20000 BATCH_SIZE=1024 BUFFER_MULTIPLIER=16 SEED=0 \
   bash examples/topology_optimization/run_spark_best_topopt.sh
 ```
 
-Default Spark config is the current best learning setup:
+Default Spark script config, if unchanged, is historical:
 
 ```text
 topk_volume + LSGAN + Conv G + MLP D + Muon/Muon + scheduled topology curiosity
@@ -619,10 +711,44 @@ curiosity=0.1, warmup_cosine, warmup_frac=0.05
 generator_channels=64, latent_dim=64
 ```
 
+This is not the latest TOM/GiNN-scale recommendation. The current recommended
+Spark/DGX run is explicit:
+
+```bash
+python examples/topology_optimization/cantilever_fem.py \
+  --preset tom_cantilever_2d \
+  --n_iter 10000 --batch_size 64 --buffer_multiplier 8 \
+  --latent_dim 64 \
+  --encoding topk_volume \
+  --optimizer_type quantile_ranked_default \
+  --ranker_list_size 64 \
+  --ranker_steps 1 \
+  --ranker_sample_pool_size 128 \
+  --ranker_sample_mode random_top_pool \
+  --ranker_weight 1.0 \
+  --ranker_target_curve exp \
+  --ranker_target_scope local \
+  --ranker_tau 4 \
+  --curiosity 0 \
+  --projection_beta 1 \
+  --fem_workers 8 \
+  --seed 0 \
+  --g_torch_optimizer muon \
+  --d_torch_optimizer muon \
+  --g_lr 0.03 --d_lr 0.03 \
+  --generator_type conv \
+  --discriminator_type mlp \
+  --generator_channels 64 \
+  --discriminator_hidden_dims 128 128 \
+  --output_dir results/fem_cantilever_tom_preset_quantile_tau4_iter10000_workers8_seed0
+```
+
 ## Caveats
 
 - Results are single-seed unless noted; seed sweep is required before claiming robustness.
 - Current FEM is CPU SciPy sparse solve; GPU only helps the neural nets unless a GPU FEM backend is integrated.
+- TOM/GiNN-scale runs should use `--preset tom_cantilever_2d`; do not compare their absolute compliance to the old 40x20 toy setting.
+- `--fem_workers` parallelizes SciPy FEM batch evaluation. Retune worker count on the target machine.
 - `topk_volume` is discrete. The discriminator sees raw scores in the best setup; the evaluator applies top-k projection.
 - `tiny_decoder` is MLP-only for now and does not support `--train_on_decoded` or topology-space curiosity.
 - The local Muon implementation is experimental and self-contained in the example file.
