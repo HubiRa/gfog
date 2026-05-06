@@ -3,6 +3,7 @@ import math
 import random
 import sys
 import types
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -17,7 +18,7 @@ import torch.nn.functional as F
 from loguru import logger
 from torch.nn import BCEWithLogitsLoss
 
-from gfog.buffer import Buffer, Levels
+from gfog.buffer import Buffer, Levels, Rung
 from gfog.curiosity import WarmupCosine, WangIsolaUniformity, WangIsolaUniformityConfig
 from gfog.curiosity.scheduler import Scheduler
 from gfog.models import MLP
@@ -42,10 +43,13 @@ EncodingMode = Literal[
     "coarse_topk_volume",
     "coarse_residual",
     "soft_volume",
+    "tiny_decoder",
 ]
 
 
 LadderKind = Literal["volume", "compliance", "roughness"]
+LoadCase = Literal["center_point", "tom_two_patches"]
+ProblemPreset = Literal["default", "tom_cantilever_2d"]
 
 
 class ConvDecoderGenerator(nn.Module):
@@ -129,6 +133,8 @@ class ConvDiscriminator(nn.Module):
 class FEMConfig:
     grid_width: int = 32
     grid_height: int = 16
+    domain_width: float = 1.0
+    domain_height: float = 1.0
     coarse_grid_width: int | None = None
     coarse_grid_height: int | None = None
     encoding: EncodingMode = "direct"
@@ -143,11 +149,20 @@ class FEMConfig:
     compliance_ladder: tuple[float, ...] = ()
     roughness_ladder: tuple[float, ...] = ()
     ladder_sequence: tuple[tuple[LadderKind, float], ...] = ()
+    use_levels_ladder: bool = False
+    levels_ladder_objectives: tuple[str, ...] = ()
     load_scale: float = 1.0
+    load_case: LoadCase = "center_point"
+    fem_workers: int = 1
     density_filter_radius: int = 1
     projection_beta: float = 0.0
     projection_eta: float = 0.5
     hard_binarize: bool = False
+    tiny_decoder_model: str = "madebyollin/taesd"
+    tiny_decoder_latent_channels: int = 4
+    tiny_decoder_latent_height: int = 8
+    tiny_decoder_latent_width: int = 8
+    tiny_decoder_latent_scale: float = 1.0
 
 
 def decode_design_logits_numpy(x: np.ndarray) -> np.ndarray:
@@ -309,6 +324,37 @@ def parse_ladder_sequence(specs: list[str]) -> tuple[tuple[LadderKind, float], .
     return tuple(parsed)
 
 
+def parse_levels_ladder_specs(specs: list[str]) -> list[Rung]:
+    """Parse official Levels.ladder specs like compliance:130,110,100."""
+    allowed = {"volume", "roughness", "compliance"}
+    rungs: list[Rung] = []
+    for spec in specs:
+        parts = [part.strip() for part in spec.split(":")]
+        if len(parts) == 2:
+            name, thresholds_raw = parts
+            direction = "min"
+        elif len(parts) == 3:
+            name, direction, thresholds_raw = parts
+        else:
+            raise ValueError(
+                "Invalid --levels_ladder spec. Expected name:v1,v2 or name:min:v1,v2"
+            )
+        if name not in allowed:
+            raise ValueError(
+                f"Invalid ladder objective '{name}'. Expected one of {sorted(allowed)}"
+            )
+        if direction not in {"min", "max"}:
+            raise ValueError(f"Invalid ladder direction '{direction}'")
+        thresholds = [float(value) for value in thresholds_raw.split(",") if value]
+        if not thresholds:
+            raise ValueError(f"No thresholds provided for ladder objective '{name}'")
+        if direction == "min":
+            rungs.append(Rung.minimize(name, thresholds))
+        else:
+            rungs.append(Rung.maximize(name, thresholds))
+    return rungs
+
+
 def get_level_names(
     volume_ladder: list[float],
     compliance_ladder: list[float],
@@ -370,9 +416,8 @@ class FEMCantileverEvaluator:
         self.config = config
         self.nelx = config.grid_width
         self.nely = config.grid_height
-        self.code_width = config.coarse_grid_width or config.grid_width
-        self.code_height = config.coarse_grid_height or config.grid_height
-        self.code_dim = self.code_width * self.code_height
+        self._configure_code_shape()
+        self.tiny_decoder: Any | None = None
         self.nelems = self.nelx * self.nely
         self.nnodes = (self.nelx + 1) * (self.nely + 1)
         self.ndof = 2 * self.nnodes
@@ -384,6 +429,63 @@ class FEMCantileverEvaluator:
         self.force = self._build_force_vector()
         self.filter_offsets, self.filter_weights = self._build_filter_kernel()
         self.solid_compliance = self._compute_solid_compliance()
+
+    def _configure_code_shape(self) -> None:
+        if self.config.encoding == "tiny_decoder":
+            self.code_width = self.config.tiny_decoder_latent_width
+            self.code_height = self.config.tiny_decoder_latent_height
+            self.code_channels = self.config.tiny_decoder_latent_channels
+        else:
+            self.code_width = self.config.coarse_grid_width or self.config.grid_width
+            self.code_height = self.config.coarse_grid_height or self.config.grid_height
+            self.code_channels = 1
+        self.code_dim = self.code_channels * self.code_width * self.code_height
+
+    def _load_tiny_decoder(self) -> Any:
+        if self.tiny_decoder is not None:
+            return self.tiny_decoder
+        try:
+            from diffusers import AutoencoderTiny
+        except ImportError as exc:
+            raise ImportError(
+                "--encoding tiny_decoder requires diffusers. Install it and make "
+                "the configured --tiny_decoder_model available locally or via Hugging Face."
+            ) from exc
+
+        decoder = AutoencoderTiny.from_pretrained(self.config.tiny_decoder_model)
+        decoder.eval()
+        for parameter in decoder.parameters():
+            parameter.requires_grad_(False)
+        self.tiny_decoder = decoder.to("cpu")
+        return self.tiny_decoder
+
+    def _decode_tiny_decoder_numpy(self, x_np: np.ndarray) -> np.ndarray:
+        latent = torch.from_numpy(x_np.reshape(-1, self.code_dim)).to(torch.float32)
+        latent = torch.tanh(latent) * self.config.tiny_decoder_latent_scale
+        latent = latent.reshape(
+            -1,
+            self.config.tiny_decoder_latent_channels,
+            self.config.tiny_decoder_latent_height,
+            self.config.tiny_decoder_latent_width,
+        )
+        decoder = self._load_tiny_decoder()
+        with torch.no_grad():
+            decoded = decoder.decode(latent)
+            image = decoded.sample if hasattr(decoded, "sample") else decoded
+            image = torch.clamp((image + 1.0) * 0.5, 0.0, 1.0)
+            gray = image.mean(dim=1, keepdim=True)
+            resized = F.interpolate(
+                gray,
+                size=(self.nely, self.nelx),
+                mode="bilinear",
+                align_corners=False,
+            )
+        scores = resized[:, 0].reshape(-1, self.nely * self.nelx).cpu().numpy()
+        k = int(round(self.config.volume_max * self.nely * self.nelx))
+        return np.stack(
+            [project_scores_to_topk_binary_numpy(sample, k) for sample in scores],
+            axis=0,
+        ).reshape(-1, self.nely, self.nelx)
 
     def _element_stiffness(self, nu: float) -> np.ndarray:
         a11 = np.array(
@@ -444,9 +546,30 @@ class FEMCantileverEvaluator:
 
     def _build_force_vector(self) -> np.ndarray:
         force = np.zeros(self.ndof, dtype=np.float64)
+        if self.config.load_case == "tom_two_patches":
+            return self._build_tom_two_patch_force_vector(force)
+        if self.config.load_case != "center_point":
+            raise ValueError(f"Unknown load_case: {self.config.load_case}")
         load_row = self.nely // 2
         load_node = load_row * (self.nelx + 1) + self.nelx
         force[2 * load_node + 1] = -self.config.load_scale
+        return force
+
+    def _build_tom_two_patch_force_vector(self, force: np.ndarray) -> np.ndarray:
+        """Consistent nodal loads for TOM's two right-edge traction patches."""
+        edge_length = self.config.domain_height / self.nely
+        for row in range(self.nely):
+            y0 = row / self.nely
+            y1 = (row + 1) / self.nely
+            yc = 0.5 * (y0 + y1)
+            in_patch = (0.1 < yc < 0.2) or (0.8 < yc < 0.9)
+            if not in_patch:
+                continue
+            lower_node = row * (self.nelx + 1) + self.nelx
+            upper_node = (row + 1) * (self.nelx + 1) + self.nelx
+            nodal_force = -0.5 * self.config.load_scale * edge_length
+            force[2 * lower_node + 1] += nodal_force
+            force[2 * upper_node + 1] += nodal_force
         return force
 
     def _build_filter_kernel(self) -> tuple[list[tuple[int, int]], np.ndarray]:
@@ -574,6 +697,8 @@ class FEMCantileverEvaluator:
                 ],
                 axis=0,
             ).reshape(-1, self.nely, self.nelx)
+        elif self.config.encoding == "tiny_decoder":
+            x_phys = self._decode_tiny_decoder_numpy(x_np)
         elif self.config.encoding == "coarse_topk_volume":
             coarse_scores = x_np.reshape(-1, self.code_height, self.code_width)
             upsampled_scores = expand_design_code_numpy(
@@ -701,43 +826,65 @@ class FEMCantileverEvaluator:
         )
         return self._solve_compliance(solid)
 
-    def evaluate_densities_numpy(self, x_phys: np.ndarray) -> list[list[float]]:
-        results: list[list[float]] = []
-        for sample in np.asarray(x_phys, dtype=np.float64).reshape(
-            -1, self.nely, self.nelx
-        ):
-            volume = float(sample.mean())
-            dx = float(np.abs(sample[:, 1:] - sample[:, :-1]).mean())
-            dy = float(np.abs(sample[1:, :] - sample[:-1, :]).mean())
-            roughness = 0.5 * (dx + dy)
-            compliance = self._solve_compliance(sample)
-            level_values: list[float] = []
-            if self.config.ladder_sequence:
-                for kind, bound in self.config.ladder_sequence:
-                    if kind == "volume":
-                        level_values.append(max(volume - bound, 0.0))
-                    elif kind == "compliance":
-                        level_values.append(max(compliance - bound, 0.0))
-                    elif kind == "roughness":
-                        level_values.append(max(roughness - bound, 0.0))
-                    else:
-                        raise ValueError(f"Unknown ladder kind: {kind}")
-            else:
-                for bound in self.config.volume_ladder:
+    def density_objectives(self, sample: np.ndarray) -> tuple[float, float, float]:
+        volume = float(sample.mean())
+        dx = float(np.abs(sample[:, 1:] - sample[:, :-1]).mean())
+        dy = float(np.abs(sample[1:, :] - sample[:-1, :]).mean())
+        roughness = 0.5 * (dx + dy)
+        compliance = self._solve_compliance(sample)
+        return volume, roughness, compliance
+
+    def _format_objective_values(
+        self, volume: float, roughness: float, compliance: float
+    ) -> list[float]:
+        if self.config.use_levels_ladder:
+            objective_values = {
+                "volume": volume,
+                "roughness": roughness,
+                "compliance": compliance,
+            }
+            return [
+                objective_values[name] for name in self.config.levels_ladder_objectives
+            ]
+
+        level_values: list[float] = []
+        if self.config.ladder_sequence:
+            for kind, bound in self.config.ladder_sequence:
+                if kind == "volume":
                     level_values.append(max(volume - bound, 0.0))
-                for bound in self.config.compliance_ladder:
+                elif kind == "compliance":
                     level_values.append(max(compliance - bound, 0.0))
-                for bound in self.config.roughness_ladder:
+                elif kind == "roughness":
                     level_values.append(max(roughness - bound, 0.0))
-            level_values.extend(
-                [
-                    max(volume - self.config.volume_max, 0.0),
-                    max(roughness - self.config.roughness_max, 0.0),
-                    compliance,
-                ]
-            )
-            results.append(level_values)
-        return results
+                else:
+                    raise ValueError(f"Unknown ladder kind: {kind}")
+        else:
+            for bound in self.config.volume_ladder:
+                level_values.append(max(volume - bound, 0.0))
+            for bound in self.config.compliance_ladder:
+                level_values.append(max(compliance - bound, 0.0))
+            for bound in self.config.roughness_ladder:
+                level_values.append(max(roughness - bound, 0.0))
+        level_values.extend(
+            [
+                max(volume - self.config.volume_max, 0.0),
+                max(roughness - self.config.roughness_max, 0.0),
+                compliance,
+            ]
+        )
+        return level_values
+
+    def evaluate_densities_numpy(self, x_phys: np.ndarray) -> list[list[float]]:
+        samples = np.asarray(x_phys, dtype=np.float64).reshape(-1, self.nely, self.nelx)
+        if self.config.fem_workers <= 1 or len(samples) <= 1:
+            objectives = [self.density_objectives(sample) for sample in samples]
+        else:
+            with ThreadPoolExecutor(max_workers=self.config.fem_workers) as pool:
+                objectives = list(pool.map(self.density_objectives, samples))
+        return [
+            self._format_objective_values(volume, roughness, compliance)
+            for volume, roughness, compliance in objectives
+        ]
 
     def __call__(self, theta: torch.Tensor | np.ndarray) -> list[list[float]]:
         if isinstance(theta, torch.Tensor):
@@ -762,9 +909,8 @@ class TorchFEMCantileverEvaluator(FEMCantileverEvaluator):
         self.config = config
         self.nelx = config.grid_width
         self.nely = config.grid_height
-        self.code_width = config.coarse_grid_width or config.grid_width
-        self.code_height = config.coarse_grid_height or config.grid_height
-        self.code_dim = self.code_width * self.code_height
+        self._configure_code_shape()
+        self.tiny_decoder: Any | None = None
         self.nelems = self.nelx * self.nely
         self.device = torch.device(device)
         self.dtype = torch.float64
@@ -1011,6 +1157,28 @@ def plackett_luce_loss(scores_best_to_worst: torch.Tensor) -> torch.Tensor:
     return -(scores - log_denoms).mean()
 
 
+def rank_targets(
+    n: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    curve: str = "linear",
+    tau: float = 16.0,
+) -> torch.Tensor:
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    ranks = torch.arange(n, device=device, dtype=dtype)
+    if curve == "linear":
+        if n == 1:
+            return torch.ones((1,), device=device, dtype=dtype)
+        return 1.0 - ranks / float(n - 1)
+    if curve == "exp":
+        if tau <= 0:
+            raise ValueError(f"ranker_tau must be positive, got {tau}")
+        return torch.exp(-ranks / tau)
+    raise ValueError(f"Unknown rank target curve: {curve}")
+
+
 class EvaluatedArchive:
     """Replay archive containing all evaluated tensors and objective values."""
 
@@ -1118,25 +1286,62 @@ class BufferPlackettLuceRankerOpt(BaseOpt):
         ranker_list_size: int = 32,
         ranker_steps: int = 1,
         generator_elite_margin: bool = False,
+        ranker_sample_pool_size: int | None = None,
+        ranker_sample_mode: str = "random_top_pool",
     ) -> None:
         self.ranker_list_size = ranker_list_size
         self.ranker_steps = ranker_steps
         self.generator_elite_margin = generator_elite_margin
+        self.ranker_sample_pool_size = ranker_sample_pool_size
+        if ranker_sample_mode not in {"random_top_pool", "top_k"}:
+            raise ValueError(
+                "ranker_sample_mode must be one of random_top_pool, top_k; "
+                f"got {ranker_sample_mode}"
+            )
+        self.ranker_sample_mode = ranker_sample_mode
         super().__init__(components)
 
-    def _ranked_buffer_subset(self, k: int) -> torch.Tensor:
+    def _ranked_buffer_subset_with_positions(
+        self, k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         current_len = len(self.buffer.B)
         if current_len == 0:
             raise RuntimeError("Cannot sample from an empty buffer")
-        k = min(k, current_len)
-        if k == current_len:
+        if self.ranker_sample_mode == "top_k":
+            k = min(k, current_len)
             ranked = self.buffer.B.get_top_k(k)
+            positions = torch.arange(
+                k,
+                device=self.gan.device,
+                dtype=self.gan.dtype,
+            )
+            return ranked.to(self.gan.device, self.gan.dtype), positions
+        pool_size = current_len
+        if self.ranker_sample_pool_size is not None:
+            pool_size = min(current_len, max(k, self.ranker_sample_pool_size))
+        k = min(k, pool_size)
+        if k == pool_size:
+            ranked = self.buffer.B.get_top_k(k)
+            positions = torch.arange(
+                k,
+                device=self.gan.device,
+                dtype=self.gan.dtype,
+            )
         else:
             # Buffer indices are already sorted best-to-worst, so sampled sorted
             # positions preserve the true lexicographic order.
-            positions = torch.randperm(current_len)[:k].sort().values.tolist()
-            ranked = torch.stack([self.buffer.B.get(int(pos)) for pos in positions])
-        return ranked.to(self.gan.device, self.gan.dtype)
+            position_list = torch.randperm(pool_size)[:k].sort().values.tolist()
+            ranked = torch.stack([self.buffer.B.get(int(pos)) for pos in position_list])
+            positions = torch.as_tensor(
+                position_list,
+                device=self.gan.device,
+                dtype=self.gan.dtype,
+            )
+        return ranked.to(self.gan.device, self.gan.dtype), positions
+
+    def _ranked_buffer_subset(self, k: int) -> torch.Tensor:
+        ranked, _ = self._ranked_buffer_subset_with_positions(k)
+        return ranked
 
     def _train_ranker_step(self) -> None:
         if len(self.buffer.B) < 2:
@@ -1186,12 +1391,16 @@ class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
         ranker_list_size: int = 32,
         ranker_steps: int = 1,
         ranker_weight: float = 0.1,
+        ranker_sample_pool_size: int | None = None,
+        ranker_sample_mode: str = "random_top_pool",
     ) -> None:
         super().__init__(
             opt_components,
             ranker_list_size=ranker_list_size,
             ranker_steps=ranker_steps,
             generator_elite_margin=False,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
         )
         if ranker_weight < 0:
             raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
@@ -1232,6 +1441,223 @@ class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
         return proposals
 
 
+class RankedDefaultOpt(BufferPlackettLuceRankerOpt):
+    """Vanilla GAN with an auxiliary Plackett-Luce ranking loss on buffer elites."""
+
+    def __init__(
+        self,
+        opt_components: components.OptComponents,
+        *,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        ranker_weight: float = 0.1,
+        ranker_sample_pool_size: int | None = None,
+        ranker_sample_mode: str = "random_top_pool",
+    ) -> None:
+        super().__init__(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=False,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+        )
+        if ranker_weight < 0:
+            raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
+        self.ranker_weight = ranker_weight
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+
+        ranked = self._ranked_buffer_subset(self.ranker_list_size)
+        real_scores = self.gan.D(ranked).reshape(-1)
+        rank_loss = plackett_luce_loss(real_scores)
+
+        with torch.no_grad():
+            z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+            fake = self.gan.G(z)
+        fake_scores = self.gan.D(fake.detach())
+        fake_loss = self.gan.loss(fake_scores, torch.zeros_like(fake_scores))
+
+        loss = fake_loss + self.ranker_weight * rank_loss
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self.gan.G(z)
+        scores = self.gan.D(proposals)
+        loss = self.gan.loss(scores, torch.ones_like(scores))
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return proposals
+
+
+class RankedWGANOpt(BufferPlackettLuceRankerOpt):
+    """WGAN with an auxiliary Plackett-Luce ranking loss on buffer elites."""
+
+    def __init__(
+        self,
+        opt_components: components.OptComponents,
+        *,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        ranker_weight: float = 0.1,
+        ranker_sample_pool_size: int | None = None,
+        ranker_sample_mode: str = "random_top_pool",
+    ) -> None:
+        super().__init__(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=False,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+        )
+        if ranker_weight < 0:
+            raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
+        self.ranker_weight = ranker_weight
+
+    def _apply_weight_clipping(self) -> None:
+        if self.components.weight_clip is None:
+            return
+        for parameter in self.gan.D.parameters():
+            parameter.data.clamp_(
+                -self.components.weight_clip,
+                self.components.weight_clip,
+            )
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+
+        ranked = self._ranked_buffer_subset(self.ranker_list_size)
+        real_scores = self.gan.D(ranked).reshape(-1)
+        rank_loss = plackett_luce_loss(real_scores)
+
+        with torch.no_grad():
+            z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+            fake = self.gan.G(z)
+        fake_scores = self.gan.D(fake.detach()).reshape(-1)
+
+        loss = fake_scores.mean() + self.ranker_weight * rank_loss
+        loss.backward()
+        self.gan.optimizerD.step()
+        self._apply_weight_clipping()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self.gan.G(z)
+        loss = -self.gan.D(proposals).reshape(-1).mean()
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return proposals
+
+
+class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
+    """Vanilla GAN with rank-quantile targets for current buffer elites."""
+
+    def __init__(
+        self,
+        opt_components: components.OptComponents,
+        *,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        ranker_weight: float = 1.0,
+        ranker_target_curve: str = "linear",
+        ranker_tau: float = 16.0,
+        ranker_sample_pool_size: int | None = None,
+        ranker_sample_mode: str = "random_top_pool",
+        ranker_target_scope: str = "local",
+    ) -> None:
+        super().__init__(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=False,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+        )
+        if ranker_weight < 0:
+            raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
+        self.ranker_weight = ranker_weight
+        self.ranker_target_curve = ranker_target_curve
+        self.ranker_tau = ranker_tau
+        if ranker_target_scope not in {"local", "global"}:
+            raise ValueError(
+                "ranker_target_scope must be one of local, global; "
+                f"got {ranker_target_scope}"
+            )
+        self.ranker_target_scope = ranker_target_scope
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+
+        ranked, positions = self._ranked_buffer_subset_with_positions(
+            self.ranker_list_size
+        )
+        real_scores = self.gan.D(ranked)
+        if self.ranker_target_scope == "global":
+            real_targets = rank_targets(
+                len(self.buffer.B),
+                device=real_scores.device,
+                dtype=real_scores.dtype,
+                curve=self.ranker_target_curve,
+                tau=self.ranker_tau,
+            )[positions.long()].reshape_as(real_scores)
+        else:
+            real_targets = rank_targets(
+                real_scores.numel(),
+                device=real_scores.device,
+                dtype=real_scores.dtype,
+                curve=self.ranker_target_curve,
+                tau=self.ranker_tau,
+            ).reshape_as(real_scores)
+        real_loss = self.gan.loss(real_scores, real_targets)
+
+        with torch.no_grad():
+            z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+            fake = self.gan.G(z)
+        fake_scores = self.gan.D(fake.detach())
+        fake_loss = self.gan.loss(fake_scores, torch.zeros_like(fake_scores))
+
+        loss = fake_loss + self.ranker_weight * real_loss
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self.gan.G(z)
+        scores = self.gan.D(proposals)
+        loss = self.gan.loss(scores, torch.ones_like(scores))
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return proposals
+
+
 def make_optimizer(
     optimizer_type: str,
     opt_components: components.OptComponents,
@@ -1241,6 +1667,11 @@ def make_optimizer(
     ranker_steps: int = 1,
     ranker_generator_elite_margin: bool = False,
     ranker_weight: float = 0.1,
+    ranker_target_curve: str = "linear",
+    ranker_tau: float = 16.0,
+    ranker_sample_pool_size: int | None = None,
+    ranker_sample_mode: str = "random_top_pool",
+    ranker_target_scope: str = "local",
 ) -> BaseOpt:
     if optimizer_type == "default":
         return DefaultOpt(opt_components)
@@ -1266,6 +1697,8 @@ def make_optimizer(
             ranker_list_size=ranker_list_size,
             ranker_steps=ranker_steps,
             generator_elite_margin=ranker_generator_elite_margin,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
         )
     if optimizer_type == "ranked_lsgan":
         return RankedLSGANOpt(
@@ -1273,6 +1706,38 @@ def make_optimizer(
             ranker_list_size=ranker_list_size,
             ranker_steps=ranker_steps,
             ranker_weight=ranker_weight,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+        )
+    if optimizer_type == "ranked_default":
+        return RankedDefaultOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            ranker_weight=ranker_weight,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+        )
+    if optimizer_type == "ranked_wgan":
+        return RankedWGANOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            ranker_weight=ranker_weight,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+        )
+    if optimizer_type == "quantile_ranked_default":
+        return QuantileRankedDefaultOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            ranker_weight=ranker_weight,
+            ranker_target_curve=ranker_target_curve,
+            ranker_tau=ranker_tau,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+            ranker_target_scope=ranker_target_scope,
         )
     raise ValueError(f"Unknown optimizer_type: {optimizer_type}")
 
@@ -1427,8 +1892,16 @@ def make_torch_optimizer(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GFog FEM cantilever benchmark")
+    parser.add_argument(
+        "--preset",
+        choices=["default", "tom_cantilever_2d"],
+        default="default",
+        help="Apply a named benchmark preset before constructing the evaluator.",
+    )
     parser.add_argument("--grid_width", type=int, default=32)
     parser.add_argument("--grid_height", type=int, default=16)
+    parser.add_argument("--domain_width", type=float, default=1.0)
+    parser.add_argument("--domain_height", type=float, default=1.0)
     parser.add_argument("--backend", choices=["scipy", "torchfem"], default="scipy")
     parser.add_argument("--torchfem_src", type=str, default=None)
     parser.add_argument("--torchfem_device", type=str, default="cpu")
@@ -1445,12 +1918,18 @@ def build_parser() -> argparse.ArgumentParser:
             "coarse_topk_volume",
             "coarse_residual",
             "soft_volume",
+            "tiny_decoder",
         ],
         default="direct",
     )
     parser.add_argument("--residual_scale", type=float, default=0.25)
     parser.add_argument("--coarse_grid_width", type=int, default=None)
     parser.add_argument("--coarse_grid_height", type=int, default=None)
+    parser.add_argument("--tiny_decoder_model", type=str, default="madebyollin/taesd")
+    parser.add_argument("--tiny_decoder_latent_channels", type=int, default=4)
+    parser.add_argument("--tiny_decoder_latent_height", type=int, default=8)
+    parser.add_argument("--tiny_decoder_latent_width", type=int, default=8)
+    parser.add_argument("--tiny_decoder_latent_scale", type=float, default=1.0)
     parser.add_argument("--generator_type", choices=["mlp", "conv"], default="mlp")
     parser.add_argument("--discriminator_type", choices=["mlp", "conv"], default="mlp")
     parser.add_argument("--generator_channels", type=int, default=64)
@@ -1478,6 +1957,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curiosity_warmup_frac", type=float, default=0.05)
     parser.add_argument("--curiosity_min", type=float, default=0.0)
     parser.add_argument(
+        "--curiosity_reference",
+        choices=["buffer", "batch"],
+        default="buffer",
+        help="Apply curiosity to generated batch only or generated batch plus buffer.",
+    )
+    parser.add_argument(
         "--train_on_decoded",
         action="store_true",
         help=(
@@ -1497,6 +1982,9 @@ def build_parser() -> argparse.ArgumentParser:
             "plackett_luce",
             "buffer_plackett_luce",
             "ranked_lsgan",
+            "ranked_default",
+            "ranked_wgan",
+            "quantile_ranked_default",
         ],
         default="default",
     )
@@ -1505,10 +1993,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ranker_archive_size", type=int, default=8192)
     parser.add_argument("--ranker_generator_elite_margin", action="store_true")
     parser.add_argument(
+        "--ranker_sample_pool_size",
+        type=int,
+        default=None,
+        help="Sample ranker lists from only the top N buffer entries.",
+    )
+    parser.add_argument(
+        "--ranker_sample_mode",
+        choices=["random_top_pool", "top_k"],
+        default="random_top_pool",
+        help="Use random sorted samples from the ranker pool or exact top-k lists.",
+    )
+    parser.add_argument(
         "--ranker_weight",
         type=float,
         default=0.1,
-        help="Weight for auxiliary PL rank loss in ranked_lsgan.",
+        help="Weight for auxiliary PL rank loss in ranked_* optimizers.",
+    )
+    parser.add_argument(
+        "--ranker_target_curve",
+        choices=["linear", "exp"],
+        default="linear",
+        help="Rank target curve for quantile_ranked_default.",
+    )
+    parser.add_argument(
+        "--ranker_tau",
+        type=float,
+        default=16.0,
+        help="Exponential rank target decay for --ranker_target_curve exp.",
+    )
+    parser.add_argument(
+        "--ranker_target_scope",
+        choices=["local", "global"],
+        default="local",
+        help="Use local sampled-list ranks or global buffer ranks for quantile targets.",
     )
     parser.add_argument(
         "--g_torch_optimizer",
@@ -1525,6 +2043,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--g_momentum", type=float, default=0.9)
     parser.add_argument("--d_momentum", type=float, default=0.9)
     parser.add_argument("--discriminator_steps", type=int, default=3)
+    parser.add_argument(
+        "--elite_sampling",
+        choices=["random_top_k", "top_k"],
+        default="random_top_k",
+        help="How GAN optimizers sample real elite batches from the buffer.",
+    )
+    parser.add_argument(
+        "--elite_pool_size",
+        type=int,
+        default=None,
+        help="Top-k pool size for random_top_k elite sampling. Defaults to buffer size.",
+    )
     parser.add_argument("--weight_clip", type=float, default=0.01)
     parser.add_argument("--gradient_penalty_weight", type=float, default=10.0)
     parser.add_argument("--volume_max", type=float, default=0.48)
@@ -1539,10 +2069,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Explicit interleaved ladder sequence like volume:0.52 compliance:318 volume:0.50 compliance:314",
     )
+    parser.add_argument(
+        "--levels_ladder",
+        nargs="*",
+        type=str,
+        default=[],
+        help=(
+            "Use official Levels.ladder with raw objectives, e.g. "
+            "volume:0.55,0.50 compliance:130,110,100"
+        ),
+    )
+    parser.add_argument(
+        "--levels_ladder_final_open",
+        type=str,
+        default="compliance",
+        help="Optional objective name for final open rung tie-breaker.",
+    )
     parser.add_argument("--simp_p", type=float, default=3.0)
     parser.add_argument("--e_min", type=float, default=1e-3)
     parser.add_argument("--e_max", type=float, default=1.0)
     parser.add_argument("--poisson_ratio", type=float, default=0.3)
+    parser.add_argument("--load_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--load_case",
+        choices=["center_point", "tom_two_patches"],
+        default="center_point",
+    )
+    parser.add_argument(
+        "--fem_workers",
+        type=int,
+        default=1,
+        help="Number of CPU worker threads for parallel SciPy FEM batch evaluation.",
+    )
     parser.add_argument("--density_filter_radius", type=int, default=1)
     parser.add_argument("--projection_beta", type=float, default=0.0)
     parser.add_argument("--projection_eta", type=float, default=0.5)
@@ -1560,6 +2118,20 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    if args.preset == "tom_cantilever_2d":
+        args.grid_width = 150
+        args.grid_height = 100
+        args.domain_width = 1.5
+        args.domain_height = 1.0
+        args.volume_max = 0.48
+        args.e_max = 196.0
+        args.e_min = 196.0e-6
+        args.poisson_ratio = 0.3
+        args.load_scale = 1.0
+        args.load_case = "tom_two_patches"
+        if args.density_filter_radius == 1:
+            args.density_filter_radius = 0
+
     if args.train_on_decoded:
         if args.encoding not in {"direct", "soft_volume", "coarse", "coarse_residual"}:
             raise ValueError(
@@ -1567,12 +2139,37 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             )
         if args.hard_binarize:
             raise ValueError("--train_on_decoded does not support --hard_binarize")
+    if args.encoding == "tiny_decoder":
+        if args.generator_type != "mlp":
+            raise ValueError(
+                "--encoding tiny_decoder currently requires --generator_type mlp"
+            )
+        if args.curiosity_space == "topology":
+            raise ValueError(
+                "--encoding tiny_decoder does not support --curiosity_space topology yet"
+            )
+    if args.fem_workers < 1:
+        raise ValueError(f"--fem_workers must be >= 1, got {args.fem_workers}")
+    if args.backend == "torchfem" and args.fem_workers != 1:
+        raise ValueError("--fem_workers > 1 is only supported for --backend scipy")
 
     ladder_sequence = parse_ladder_sequence(args.ladder_sequence)
+    levels_ladder_rungs = parse_levels_ladder_specs(args.levels_ladder)
+    if levels_ladder_rungs and (
+        args.volume_ladder
+        or args.compliance_ladder
+        or args.roughness_ladder
+        or ladder_sequence
+    ):
+        raise ValueError(
+            "--levels_ladder cannot be combined with topology-specific ladder args"
+        )
 
     cfg = FEMConfig(
         grid_width=args.grid_width,
         grid_height=args.grid_height,
+        domain_width=args.domain_width,
+        domain_height=args.domain_height,
         coarse_grid_width=args.coarse_grid_width,
         coarse_grid_height=args.coarse_grid_height,
         encoding=args.encoding,
@@ -1587,10 +2184,20 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         compliance_ladder=tuple(args.compliance_ladder),
         roughness_ladder=tuple(args.roughness_ladder),
         ladder_sequence=ladder_sequence,
+        use_levels_ladder=bool(levels_ladder_rungs),
+        levels_ladder_objectives=tuple(rung.name for rung in levels_ladder_rungs),
+        load_scale=args.load_scale,
+        load_case=args.load_case,
+        fem_workers=args.fem_workers,
         density_filter_radius=args.density_filter_radius,
         projection_beta=args.projection_beta,
         projection_eta=args.projection_eta,
         hard_binarize=args.hard_binarize,
+        tiny_decoder_model=args.tiny_decoder_model,
+        tiny_decoder_latent_channels=args.tiny_decoder_latent_channels,
+        tiny_decoder_latent_height=args.tiny_decoder_latent_height,
+        tiny_decoder_latent_width=args.tiny_decoder_latent_width,
+        tiny_decoder_latent_scale=args.tiny_decoder_latent_scale,
     )
     if args.backend == "scipy":
         evaluator = FEMCantileverEvaluator(cfg)
@@ -1605,10 +2212,15 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
     code_height = args.coarse_grid_height or args.grid_height
     code_width = args.coarse_grid_width or args.grid_width
-    if args.encoding in {"direct", "soft_volume", "topk_volume"}:
+    code_channels = 1
+    if args.encoding == "tiny_decoder":
+        code_height = args.tiny_decoder_latent_height
+        code_width = args.tiny_decoder_latent_width
+        code_channels = args.tiny_decoder_latent_channels
+    elif args.encoding in {"direct", "soft_volume", "topk_volume"}:
         code_height = args.grid_height
         code_width = args.grid_width
-    coarse_dim = code_height * code_width
+    coarse_dim = code_channels * code_height * code_width
     full_dim = args.grid_height * args.grid_width
     f_dim = coarse_dim + full_dim if args.encoding == "coarse_residual" else coarse_dim
     d_input_dim = full_dim if args.train_on_decoded else f_dim
@@ -1660,16 +2272,30 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise ValueError(f"Unknown discriminator_type: {args.discriminator_type}")
 
-    level_names = get_level_names(
-        args.volume_ladder,
-        args.compliance_ladder,
-        args.roughness_ladder,
-        ladder_sequence,
-    )
+    if levels_ladder_rungs:
+        objective_names = [rung.name for rung in levels_ladder_rungs]
+        final_open = args.levels_ladder_final_open
+        if final_open == "":
+            final_open = None
+        elif final_open not in objective_names:
+            final_open = None
+        value_levels = Levels.ladder(
+            levels_ladder_rungs,
+            interleave=True,
+            final_open=final_open,
+        )
+    else:
+        level_names = get_level_names(
+            args.volume_ladder,
+            args.compliance_ladder,
+            args.roughness_ladder,
+            ladder_sequence,
+        )
+        value_levels = Levels(level_names)
     buffer = components.BufferComp(
         B=Buffer(
             buffer_size=args.buffer_multiplier * args.batch_size,
-            value_levels=Levels(level_names),
+            value_levels=value_levels,
         )
     )
 
@@ -1686,9 +2312,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
     curiosity_loss = None
     if args.curiosity > 0:
+        curiosity_use_buffer = args.curiosity_reference == "buffer"
         if args.curiosity_space == "raw":
             curiosity_loss = WangIsolaUniformity(
-                WangIsolaUniformityConfig(use_buffer=True, weight=args.curiosity),
+                WangIsolaUniformityConfig(
+                    use_buffer=curiosity_use_buffer,
+                    weight=args.curiosity,
+                ),
                 buffer=buffer.B,
                 scheduler=curiosity_scheduler,
             )
@@ -1697,7 +2327,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 evaluator=evaluator,
                 buffer=buffer.B,
                 weight=args.curiosity,
-                use_buffer=True,
+                use_buffer=curiosity_use_buffer,
                 scheduler=curiosity_scheduler,
             )
         else:
@@ -1734,9 +2364,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         batch_size=args.batch_size,
         buffer=buffer,
         discriminator_steps=args.discriminator_steps,
-        elite_sampling="random_top_k",
-        elite_pool_size=args.buffer_multiplier * args.batch_size,
-        weight_clip=args.weight_clip if args.optimizer_type == "wgan" else None,
+        elite_sampling=args.elite_sampling,
+        elite_pool_size=args.elite_pool_size
+        if args.elite_pool_size is not None
+        else args.buffer_multiplier * args.batch_size,
+        weight_clip=args.weight_clip
+        if args.optimizer_type in {"wgan", "ranked_wgan"}
+        else None,
         gradient_penalty_weight=args.gradient_penalty_weight,
     )
     if args.train_on_decoded:
@@ -1758,12 +2392,17 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             ranker_steps=args.ranker_steps,
             ranker_generator_elite_margin=args.ranker_generator_elite_margin,
             ranker_weight=args.ranker_weight,
+            ranker_target_curve=args.ranker_target_curve,
+            ranker_tau=args.ranker_tau,
+            ranker_sample_pool_size=args.ranker_sample_pool_size,
+            ranker_sample_mode=args.ranker_sample_mode,
+            ranker_target_scope=args.ranker_target_scope,
         )
 
     logger.info(
-        f"FEMCantilever: grid={args.grid_width}x{args.grid_height} code_grid={code_width}x{code_height} backend={args.backend} encoding={args.encoding} optimizer={args.optimizer_type} n_iter={args.n_iter} "
+        f"FEMCantilever: preset={args.preset} grid={args.grid_width}x{args.grid_height} domain={args.domain_width:g}x{args.domain_height:g} code_grid={code_width}x{code_height} backend={args.backend} encoding={args.encoding} optimizer={args.optimizer_type} n_iter={args.n_iter} "
         f"G={args.generator_type} D={args.discriminator_type} "
-        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_schedule={args.curiosity_schedule} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} ranker_list_size={args.ranker_list_size} ranker_steps={args.ranker_steps} ranker_weight={args.ranker_weight} filter_radius={args.density_filter_radius} residual_scale={args.residual_scale} "
+        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_reference={args.curiosity_reference} curiosity_schedule={args.curiosity_schedule} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} elite_sampling={args.elite_sampling} elite_pool_size={args.elite_pool_size} ranker_list_size={args.ranker_list_size} ranker_steps={args.ranker_steps} ranker_weight={args.ranker_weight} ranker_target_curve={args.ranker_target_curve} ranker_tau={args.ranker_tau} ranker_target_scope={args.ranker_target_scope} ranker_sample_pool_size={args.ranker_sample_pool_size} ranker_sample_mode={args.ranker_sample_mode} load_case={args.load_case} load_scale={args.load_scale} fem_workers={args.fem_workers} filter_radius={args.density_filter_radius} residual_scale={args.residual_scale} "
         f"projection_beta={args.projection_beta} hard_binarize={args.hard_binarize} train_on_decoded={args.train_on_decoded}"
     )
     optimizer.optimize(args.n_iter, verbose=True)
@@ -1783,11 +2422,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             evaluator.decode_designs_numpy(top_archive_tensors.detach().cpu().numpy())
         ).to(device=device, dtype=torch.float32)
         raw_design_code = top_archive_tensors.cpu().numpy()
-    top_values = np.asarray(buffer.B.get_sorted_values()[:top_k], dtype=np.float32)
-    summary_values = np.asarray(buffer.B.get_sorted_values(), dtype=np.float32)
-    metrics = compliance_summary(summary_values)
-    actual_compliance = top_values[:, -1].copy()
-    relative_compliance = actual_compliance / evaluator.solid_compliance
+    transformed_archive_values = np.asarray(
+        buffer.B.get_sorted_values(),
+        dtype=np.float32,
+    )
+    top_values = transformed_archive_values[:top_k]
+    summary_values = transformed_archive_values
     volume_violation = np.maximum(
         top_designs.cpu().numpy().mean(axis=(1, 2)) - args.volume_max, 0.0
     ).astype(np.float32)
@@ -1797,6 +2437,22 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     roughness_violation = np.maximum(0.5 * (dx + dy) - args.roughness_max, 0.0).astype(
         np.float32
     )
+    if levels_ladder_rungs:
+        raw_top_values = []
+        for sample in top_designs_np:
+            volume, roughness, compliance = evaluator.density_objectives(sample)
+            raw_top_values.append(
+                [
+                    max(volume - args.volume_max, 0.0),
+                    max(roughness - args.roughness_max, 0.0),
+                    compliance,
+                ]
+            )
+        top_values = np.asarray(raw_top_values, dtype=np.float32)
+        summary_values = top_values
+    metrics = compliance_summary(summary_values)
+    actual_compliance = top_values[:, -1].copy()
+    relative_compliance = actual_compliance / evaluator.solid_compliance
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"curiosity_{args.curiosity:g}_seed_{args.seed}"
@@ -1818,6 +2474,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         raw_design_code=raw_design_code,
         values=top_values,
         all_archive_values=summary_values,
+        transformed_archive_values=transformed_archive_values,
         actual_compliance=actual_compliance.astype(np.float32),
         relative_compliance=relative_compliance.astype(np.float32),
         archive_best_compliance=np.asarray(
@@ -1838,18 +2495,35 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         solid_compliance=np.asarray([evaluator.solid_compliance], dtype=np.float32),
         curiosity=np.asarray([args.curiosity], dtype=np.float32),
         curiosity_space=np.asarray([args.curiosity_space]),
+        curiosity_reference=np.asarray([args.curiosity_reference]),
         curiosity_schedule=np.asarray([args.curiosity_schedule]),
         curiosity_warmup_frac=np.asarray(
             [args.curiosity_warmup_frac], dtype=np.float32
         ),
         curiosity_min=np.asarray([args.curiosity_min], dtype=np.float32),
         seed=np.asarray([args.seed], dtype=np.int32),
+        preset=np.asarray([args.preset]),
         grid_width=np.asarray([args.grid_width], dtype=np.int32),
         grid_height=np.asarray([args.grid_height], dtype=np.int32),
+        domain_width=np.asarray([args.domain_width], dtype=np.float32),
+        domain_height=np.asarray([args.domain_height], dtype=np.float32),
         coarse_grid_width=np.asarray([code_width], dtype=np.int32),
         coarse_grid_height=np.asarray([code_height], dtype=np.int32),
         backend=np.asarray([args.backend]),
         encoding=np.asarray([args.encoding]),
+        tiny_decoder_model=np.asarray([args.tiny_decoder_model]),
+        tiny_decoder_latent_channels=np.asarray(
+            [args.tiny_decoder_latent_channels], dtype=np.int32
+        ),
+        tiny_decoder_latent_height=np.asarray(
+            [args.tiny_decoder_latent_height], dtype=np.int32
+        ),
+        tiny_decoder_latent_width=np.asarray(
+            [args.tiny_decoder_latent_width], dtype=np.int32
+        ),
+        tiny_decoder_latent_scale=np.asarray(
+            [args.tiny_decoder_latent_scale], dtype=np.float32
+        ),
         generator_type=np.asarray([args.generator_type]),
         discriminator_type=np.asarray([args.discriminator_type]),
         generator_channels=np.asarray([args.generator_channels], dtype=np.int32),
@@ -1858,6 +2532,15 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         ),
         train_on_decoded=np.asarray([args.train_on_decoded], dtype=np.int32),
         optimizer_type=np.asarray([args.optimizer_type]),
+        elite_sampling=np.asarray([args.elite_sampling]),
+        elite_pool_size=np.asarray(
+            [
+                args.elite_pool_size
+                if args.elite_pool_size is not None
+                else args.buffer_multiplier * args.batch_size
+            ],
+            dtype=np.int32,
+        ),
         ranker_list_size=np.asarray([args.ranker_list_size], dtype=np.int32),
         ranker_steps=np.asarray([args.ranker_steps], dtype=np.int32),
         ranker_archive_size=np.asarray([args.ranker_archive_size], dtype=np.int32),
@@ -1865,6 +2548,18 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             [args.ranker_generator_elite_margin], dtype=np.int32
         ),
         ranker_weight=np.asarray([args.ranker_weight], dtype=np.float32),
+        ranker_target_curve=np.asarray([args.ranker_target_curve]),
+        ranker_tau=np.asarray([args.ranker_tau], dtype=np.float32),
+        ranker_target_scope=np.asarray([args.ranker_target_scope]),
+        ranker_sample_pool_size=np.asarray(
+            [
+                -1
+                if args.ranker_sample_pool_size is None
+                else args.ranker_sample_pool_size
+            ],
+            dtype=np.int32,
+        ),
+        ranker_sample_mode=np.asarray([args.ranker_sample_mode]),
         buffer_multiplier=np.asarray([args.buffer_multiplier], dtype=np.int32),
         density_filter_radius=np.asarray([args.density_filter_radius], dtype=np.int32),
         projection_beta=np.asarray([args.projection_beta], dtype=np.float32),
@@ -1875,7 +2570,18 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         ladder_sequence=np.asarray(
             [f"{kind}:{bound:g}" for kind, bound in ladder_sequence]
         ),
+        levels_ladder=np.asarray(args.levels_ladder),
+        levels_ladder_objectives=np.asarray(
+            [rung.name for rung in levels_ladder_rungs]
+        ),
+        levels_ladder_final_open=np.asarray([args.levels_ladder_final_open]),
         residual_scale=np.asarray([args.residual_scale], dtype=np.float32),
+        load_case=np.asarray([args.load_case]),
+        load_scale=np.asarray([args.load_scale], dtype=np.float32),
+        fem_workers=np.asarray([args.fem_workers], dtype=np.int32),
+        e_max=np.asarray([args.e_max], dtype=np.float32),
+        e_min=np.asarray([args.e_min], dtype=np.float32),
+        poisson_ratio=np.asarray([args.poisson_ratio], dtype=np.float32),
         hard_binarize=np.asarray([args.hard_binarize], dtype=np.int32),
         generator_hidden_dims=np.asarray(args.generator_hidden_dims, dtype=np.int32),
         discriminator_hidden_dims=np.asarray(
