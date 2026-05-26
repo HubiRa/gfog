@@ -43,7 +43,7 @@ for mode_round in ${MODES}; do
       for latent_dim in ${LATENTS}; do
         for hidden_dim in ${HIDDENS}; do
           for seed in ${SEEDS}; do
-            output_dir="results/understanding_gfog_crypto_${mode}_r${rounds}_iter${ITER}_bs${batch_size}_bufx${buffer_multiplier}_latent${latent_dim}_hidden${hidden_dim}_curio${CURIOSITY}_seed${seed}"
+            output_dir="results/understanding_gfog_crypto_${mode}_r${rounds}_iter${ITER}_bs${batch_size}_bufx${buffer_multiplier}_latent${latent_dim}_hidden${hidden_dim}_glr${G_LR}_dlr${D_LR}_curio${CURIOSITY}_seed${seed}"
             echo "Running ${output_dir}"
             python examples/crypto_pow/sha_pow.py \
               --candidate_encoding binhead_bits \
