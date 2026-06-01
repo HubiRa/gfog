@@ -1,0 +1,16 @@
+#!/bin/bash
+# Run the demo script to verify glyfit infrastructure
+#
+# Usage: ./bin/demo [font_path]
+#
+# Examples:
+#   ./bin/demo
+#   ./bin/demo /path/to/font.ttf
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+GFOG_DIR="$(dirname "$(dirname "$PROJECT_DIR")")"
+
+export PYTHONPATH="$PROJECT_DIR/src:$GFOG_DIR/src"
+
+exec "$GFOG_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/demo_env.py" "$@"

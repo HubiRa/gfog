@@ -1,0 +1,32 @@
+#!/bin/bash
+# Optimize glyph fitting from a target image
+#
+# Usage: ./bin/optimize-from-image <experiment_dir> [options]
+#
+# Examples:
+#   ./bin/optimize-from-image experiments/generated1
+#   ./bin/optimize-from-image experiments/generated1 --n_iter 2000 --width 128 --height 128
+#
+# The experiment_dir can be:
+#   - Absolute path: /full/path/to/experiment
+#   - Relative to glyfit: experiments/generated1
+#   - Relative to cwd: ./my_experiment
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+GFOG_DIR="$(dirname "$(dirname "$PROJECT_DIR")")"
+
+export PYTHONPATH="$PROJECT_DIR/src:$GFOG_DIR/src"
+
+# Get the experiment directory argument
+EXPERIMENT_DIR="$1"
+shift  # Remove first argument, keep the rest
+
+# If not absolute, try to resolve relative to project dir first
+if [[ ! "$EXPERIMENT_DIR" = /* ]]; then
+    if [[ -d "$PROJECT_DIR/$EXPERIMENT_DIR" ]]; then
+        EXPERIMENT_DIR="$PROJECT_DIR/$EXPERIMENT_DIR"
+    fi
+fi
+
+exec "$GFOG_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/optimize_from_image.py" "$EXPERIMENT_DIR" "$@"
