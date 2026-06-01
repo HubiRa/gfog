@@ -1,7 +1,9 @@
 import argparse
+import json
 import math
 import random
 import sys
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -16,10 +18,17 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from loguru import logger
+from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from torch.nn import BCEWithLogitsLoss
 
 from gfog.buffer import Buffer, Levels, Rung
-from gfog.curiosity import WarmupCosine, WangIsolaUniformity, WangIsolaUniformityConfig
+from gfog.curiosity import (
+    CosineRamp,
+    WarmupCosine,
+    WarmupCosineAnnealing,
+    WangIsolaUniformity,
+    WangIsolaUniformityConfig,
+)
 from gfog.curiosity.scheduler import Scheduler
 from gfog.models import MLP
 from gfog.opt import (
@@ -31,7 +40,7 @@ from gfog.opt import (
     WGANGPOpt,
     components,
 )
-from gfog.opt.latents_sampler import LatentSamplerLambda
+from gfog.opt.latents_sampler import LatentSamplerBase, LatentSamplerLambda
 from gfog.utils import uniformity_loss
 
 
@@ -40,16 +49,40 @@ EncodingMode = Literal[
     "coarse",
     "binary_coarse",
     "topk_volume",
+    "sorted_material",
     "coarse_topk_volume",
     "coarse_residual",
     "soft_volume",
+    "bar_primitives",
     "tiny_decoder",
 ]
 
 
-LadderKind = Literal["volume", "compliance", "roughness"]
-LoadCase = Literal["center_point", "tom_two_patches"]
+LadderKind = Literal["volume", "compliance", "roughness", "connectivity"]
+LOAD_CASE_CHOICES = (
+    "center_point",
+    "right_top_point",
+    "right_bottom_point",
+    "right_two_points",
+    "right_edge_uniform",
+    "right_edge_shear",
+    "tom_two_patches",
+)
+LoadCase = Literal[
+    "center_point",
+    "right_top_point",
+    "right_bottom_point",
+    "right_two_points",
+    "right_edge_uniform",
+    "right_edge_shear",
+    "tom_two_patches",
+]
+RobustLoadAggregate = Literal["max", "mean", "cvar"]
 ProblemPreset = Literal["default", "tom_cantilever_2d"]
+SortedMaterialProfile = Literal["binary", "linear", "sigmoid"]
+ConvActivation = Literal["leaky_relu", "gelu", "silu"]
+LatentDistribution = Literal["normal", "uniform"]
+DesignProxyFn = Callable[[torch.Tensor], torch.Tensor]
 
 
 class ConvDecoderGenerator(nn.Module):
@@ -94,8 +127,450 @@ class ConvDecoderGenerator(nn.Module):
         return x[:, 0].reshape(z.shape[0], -1)
 
 
+class SetTransformerConvGenerator(nn.Module):
+    """Batch-aware latent set transformer followed by a convolutional decoder."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        output_height: int,
+        output_width: int,
+        channels: int = 64,
+        model_dim: int = 128,
+        depth: int = 2,
+        heads: int = 4,
+        mlp_ratio: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if model_dim % heads != 0:
+            raise ValueError(
+                f"set generator model_dim must be divisible by heads, got {model_dim} and {heads}"
+            )
+        self.token_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, model_dim),
+            nn.GELU(),
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=model_dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(model_dim)
+        self._elite_context: torch.Tensor | None = None
+        self.last_genomes: torch.Tensor | None = None
+        layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=heads,
+            dim_feedforward=mlp_ratio * model_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=depth)
+        self.decoder = ConvDecoderGenerator(
+            latent_dim=model_dim,
+            output_height=output_height,
+            output_width=output_width,
+            channels=channels,
+        )
+
+    def set_elite_context(self, elite_context: torch.Tensor | None) -> None:
+        self._elite_context = elite_context
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 2:
+            raise ValueError(
+                f"SetTransformerConvGenerator expects 2D input, got {z.shape}"
+            )
+        latent_tokens = self.token_proj(z)
+        if self._elite_context is None:
+            tokens = latent_tokens.unsqueeze(0)
+            genomes = self.encoder(tokens).squeeze(0)
+        else:
+            elite = self._elite_context.to(device=z.device, dtype=z.dtype)
+            if elite.ndim != 2 or elite.shape[1] != latent_tokens.shape[1]:
+                raise ValueError(
+                    "elite genome context must have shape "
+                    f"(n, {latent_tokens.shape[1]}), got {tuple(elite.shape)}"
+                )
+            query = latent_tokens.unsqueeze(0)
+            memory = elite.unsqueeze(0)
+            attended, _ = self.cross_attn(query=query, key=memory, value=memory)
+            tokens = self.cross_norm(query + attended)
+            genomes = self.encoder(tokens).squeeze(0)
+        self.last_genomes = genomes
+        return self.decoder(genomes)
+
+
+class SetTransformerDirectGenerator(nn.Module):
+    """Batch-aware generator that emits genome/design score vectors directly."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        output_dim: int,
+        model_dim: int = 128,
+        depth: int = 2,
+        heads: int = 4,
+        mlp_ratio: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if model_dim % heads != 0:
+            raise ValueError(
+                f"set direct generator model_dim must be divisible by heads, got {model_dim} and {heads}"
+            )
+        self.context_proj = nn.Sequential(
+            nn.LayerNorm(output_dim),
+            nn.Linear(output_dim, model_dim),
+            nn.GELU(),
+        )
+        self.token_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, model_dim),
+            nn.GELU(),
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=model_dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(model_dim)
+        self._elite_context: torch.Tensor | None = None
+        self.last_genomes: torch.Tensor | None = None
+        layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=heads,
+            dim_feedforward=mlp_ratio * model_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=depth)
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, output_dim),
+        )
+
+    def set_elite_context(self, elite_context: torch.Tensor | None) -> None:
+        self._elite_context = elite_context
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 2:
+            raise ValueError(
+                f"SetTransformerDirectGenerator expects 2D input, got {z.shape}"
+            )
+        latent_tokens = self.token_proj(z)
+        if self._elite_context is None:
+            tokens = latent_tokens.unsqueeze(0)
+        else:
+            elite = self._elite_context.to(device=z.device, dtype=z.dtype)
+            context_tokens = self.context_proj(elite)
+            query = latent_tokens.unsqueeze(0)
+            memory = context_tokens.unsqueeze(0)
+            attended, _ = self.cross_attn(query=query, key=memory, value=memory)
+            tokens = self.cross_norm(query + attended)
+        encoded = self.encoder(tokens).squeeze(0)
+        scores = self.output_head(encoded)
+        self.last_genomes = scores
+        return scores
+
+
+class NormalizedGenerator(nn.Module):
+    """Wrap a generator and normalize each emitted genome/score vector."""
+
+    def __init__(self, generator: nn.Module, mode: str, eps: float = 1e-8) -> None:
+        super().__init__()
+        if mode not in {"l2", "centered_l2", "layernorm"}:
+            raise ValueError(f"Unknown generator normalization mode: {mode}")
+        self.generator = generator
+        self.mode = mode
+        self.eps = eps
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.generator(z)
+        if self.mode == "l2":
+            return F.normalize(x, p=2, dim=1, eps=self.eps)
+        if self.mode == "centered_l2":
+            centered = x - x.mean(dim=1, keepdim=True)
+            return F.normalize(centered, p=2, dim=1, eps=self.eps)
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True, unbiased=False).clamp_min(self.eps)
+        return (x - mean) / std
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.generator, name)
+
+
+class FixedLatentBankSampler(LatentSamplerBase):
+    """Sample optimizer batches from a fixed latent bank."""
+
+    def __init__(
+        self,
+        bank: torch.Tensor,
+        batch_size: int,
+        mode: Literal["random", "shuffle_cycle"] = "shuffle_cycle",
+        noise_std: float = 0.0,
+        normalize_noise_scale: bool = True,
+    ) -> None:
+        if bank.ndim != 2:
+            raise ValueError(f"fixed latent bank must be 2D, got {tuple(bank.shape)}")
+        if len(bank) < batch_size:
+            raise ValueError(
+                f"fixed latent bank size must be >= batch_size, got {len(bank)} and {batch_size}"
+            )
+        if mode not in {"random", "shuffle_cycle"}:
+            raise ValueError(f"Unknown fixed latent sample mode: {mode}")
+        if noise_std < 0:
+            raise ValueError(
+                f"fixed latent noise std must be non-negative, got {noise_std}"
+            )
+        self.bank = bank.detach().clone()
+        self.batch_size = batch_size
+        self.mode = mode
+        self.noise_std = noise_std
+        self.normalize_noise_scale = normalize_noise_scale
+        self._order = torch.empty(0, dtype=torch.long, device=self.bank.device)
+        self._position = 0
+
+    def __call__(self) -> torch.Tensor:
+        if self.mode == "random":
+            index = torch.randint(
+                len(self.bank),
+                (self.batch_size,),
+                device=self.bank.device,
+            )
+            z = self.bank[index]
+            return self._jitter(z)
+
+        if self._position + self.batch_size > len(self._order):
+            self._order = torch.randperm(len(self.bank), device=self.bank.device)
+            self._position = 0
+        index = self._order[self._position : self._position + self.batch_size]
+        self._position += self.batch_size
+        z = self.bank[index]
+        return self._jitter(z)
+
+    def _jitter(self, z: torch.Tensor) -> torch.Tensor:
+        if self.noise_std == 0:
+            return z
+        z = z + self.noise_std * torch.randn_like(z)
+        if self.normalize_noise_scale:
+            z = z / math.sqrt(1.0 + self.noise_std * self.noise_std)
+        return z
+
+
+def sample_latents(
+    count: int,
+    latent_dim: int,
+    *,
+    distribution: LatentDistribution,
+    uniform_low: float,
+    uniform_high: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Sample latent vectors from the configured prior."""
+    if count <= 0:
+        raise ValueError(f"latent sample count must be positive, got {count}")
+    if latent_dim <= 0:
+        raise ValueError(f"latent_dim must be positive, got {latent_dim}")
+    if distribution == "normal":
+        return torch.randn(count, latent_dim, device=device, dtype=dtype)
+    if distribution == "uniform":
+        if uniform_low >= uniform_high:
+            raise ValueError(
+                f"latent_uniform_low must be < latent_uniform_high, got {uniform_low} and {uniform_high}"
+            )
+        return torch.empty(count, latent_dim, device=device, dtype=dtype).uniform_(
+            uniform_low,
+            uniform_high,
+        )
+    raise ValueError(f"Unknown latent distribution: {distribution}")
+
+
+class CombinedCuriosityLoss(nn.Module):
+    """Add multiple G-side curiosity/diversity losses."""
+
+    def __init__(self, losses: list[nn.Module]) -> None:
+        super().__init__()
+        self.losses = nn.ModuleList(losses)
+
+    def forward(self, g_out: torch.Tensor) -> torch.Tensor:
+        loss = torch.zeros((), device=g_out.device, dtype=g_out.dtype)
+        for module in self.losses:
+            loss = loss + module(g_out)
+        return loss
+
+
+class FixedLatentBankUniformity(nn.Module):
+    """Uniformity over current G outputs for a fixed latent bank."""
+
+    def __init__(
+        self,
+        generator: nn.Module,
+        bank: torch.Tensor,
+        *,
+        weight: float,
+        batch_size: int,
+        t: float = 2.0,
+        sample_mode: Literal["random", "shuffle_cycle"] = "shuffle_cycle",
+    ) -> None:
+        super().__init__()
+        if weight < 0:
+            raise ValueError(
+                f"fixed_latent_uniformity_weight must be non-negative, got {weight}"
+            )
+        if bank.ndim != 2:
+            raise ValueError(f"fixed latent bank must be 2D, got {tuple(bank.shape)}")
+        if batch_size < 2:
+            raise ValueError(
+                f"fixed_latent_uniformity_batch_size must be >= 2, got {batch_size}"
+            )
+        if sample_mode not in {"random", "shuffle_cycle"}:
+            raise ValueError(
+                f"Unknown fixed latent uniformity sample mode: {sample_mode}"
+            )
+        self.generator = generator
+        self.register_buffer("bank", bank.detach().clone())
+        self.weight = weight
+        self.batch_size = min(batch_size, len(bank))
+        self.t = t
+        self.sample_mode = sample_mode
+        self.register_buffer(
+            "_order", torch.empty(0, dtype=torch.long), persistent=False
+        )
+        self._position = 0
+
+    def _sample_bank(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        bank = self.bank.to(device=device, dtype=dtype)
+        if self.sample_mode == "random":
+            index = torch.randint(len(bank), (self.batch_size,), device=device)
+            return bank[index]
+        if self._position + self.batch_size > len(self._order):
+            self._order = torch.randperm(len(bank), device=device)
+            self._position = 0
+        index = self._order[self._position : self._position + self.batch_size]
+        self._position += self.batch_size
+        return bank[index]
+
+    def forward(self, g_out: torch.Tensor) -> torch.Tensor:
+        z = self._sample_bank(g_out.device, g_out.dtype)
+        bank_outputs = self.generator(z).reshape(z.shape[0], -1)
+        return self.weight * uniformity_loss(bank_outputs, t=self.t)
+
+
+class RankValueMLP(nn.Module):
+    """MLP with an original rank head plus an auxiliary value head."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        activation: nn.Module | None = None,
+        use_spectral_norm: bool = False,
+        disable_bias: bool = False,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim}")
+        if any(dim <= 0 for dim in hidden_dims):
+            raise ValueError(f"hidden_dims must be positive, got {hidden_dims}")
+        self.activation = activation if activation is not None else nn.GELU()
+        sn = nn.utils.spectral_norm if use_spectral_norm else (lambda layer: layer)
+        dims = [input_dim] + list(hidden_dims)
+        self.hidden_layers = nn.ModuleList(
+            [
+                sn(nn.Linear(dims[i], dims[i + 1], bias=(not disable_bias)))
+                for i in range(len(dims) - 1)
+            ]
+        )
+        head_input_dim = dims[-1]
+        # Keep this before value_head so the rank path matches the original MLP
+        # initialization order as closely as possible.
+        self.rank_head = sn(nn.Linear(head_input_dim, 1, bias=(not disable_bias)))
+        self.value_head = sn(nn.Linear(head_input_dim, 1, bias=(not disable_bias)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.hidden_layers:
+            x = self.activation(layer(x))
+        rank = self.rank_head(x)
+        value = self.value_head(x)
+        return torch.cat([rank, value], dim=-1)
+
+
+@torch.no_grad()
+def select_output_diverse_latent_bank(
+    generator: nn.Module,
+    *,
+    latent_dim: int,
+    bank_size: int,
+    candidate_multiplier: int,
+    chunk_size: int,
+    distribution: LatentDistribution,
+    uniform_low: float,
+    uniform_high: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Greedily select fixed latents whose initial generator outputs differ."""
+    if bank_size <= 0:
+        raise ValueError(f"fixed_latent_bank_size must be > 0, got {bank_size}")
+    if candidate_multiplier < 1:
+        raise ValueError(
+            f"fixed_latent_candidate_multiplier must be >= 1, got {candidate_multiplier}"
+        )
+    if chunk_size <= 0:
+        raise ValueError(f"fixed_latent_chunk_size must be > 0, got {chunk_size}")
+
+    candidate_count = bank_size * candidate_multiplier
+    candidates = sample_latents(
+        candidate_count,
+        latent_dim,
+        distribution=distribution,
+        uniform_low=uniform_low,
+        uniform_high=uniform_high,
+        device=device,
+        dtype=dtype,
+    )
+    outputs = []
+    was_training = generator.training
+    generator.eval()
+    for start in range(0, candidate_count, chunk_size):
+        chunk = candidates[start : start + chunk_size]
+        out = generator(chunk).reshape(len(chunk), -1)
+        out = out - out.mean(dim=1, keepdim=True)
+        outputs.append(F.normalize(out, p=2, dim=1, eps=1e-8).cpu())
+    if was_training:
+        generator.train()
+
+    output_bank = torch.cat(outputs, dim=0)
+    selected = torch.empty(bank_size, dtype=torch.long)
+    min_distance = torch.full((candidate_count,), float("inf"))
+    current = torch.randint(candidate_count, (1,)).item()
+    for i in range(bank_size):
+        selected[i] = current
+        distance = (output_bank - output_bank[current]).pow(2).sum(dim=1)
+        min_distance = torch.minimum(min_distance, distance)
+        min_distance[selected[: i + 1]] = -1.0
+        current = int(torch.argmax(min_distance).item())
+
+    return candidates[selected].detach()
+
+
 class ConvDiscriminator(nn.Module):
-    """Small spectral-normalized CNN discriminator for flattened grids."""
+    """Small CNN discriminator for flattened grids."""
 
     def __init__(
         self,
@@ -103,30 +578,96 @@ class ConvDiscriminator(nn.Module):
         input_width: int,
         channels: int = 32,
         use_spectral_norm: bool = True,
+        activation: ConvActivation = "leaky_relu",
+        output_dim: int = 1,
     ) -> None:
         super().__init__()
+        if output_dim <= 0:
+            raise ValueError(f"output_dim must be positive, got {output_dim}")
         self.input_height = input_height
         self.input_width = input_width
         sn = nn.utils.spectral_norm if use_spectral_norm else (lambda layer: layer)
+
+        def act() -> nn.Module:
+            if activation == "leaky_relu":
+                return nn.LeakyReLU(0.2)
+            if activation == "gelu":
+                return nn.GELU()
+            if activation == "silu":
+                return nn.SiLU()
+            raise ValueError(f"Unknown conv discriminator activation: {activation}")
+
         self.net = nn.Sequential(
             sn(nn.Conv2d(1, channels, kernel_size=5, stride=2, padding=2)),
-            nn.LeakyReLU(0.2),
+            act(),
             sn(nn.Conv2d(channels, channels * 2, kernel_size=3, stride=2, padding=1)),
-            nn.LeakyReLU(0.2),
+            act(),
             sn(
                 nn.Conv2d(
                     channels * 2, channels * 4, kernel_size=3, stride=2, padding=1
                 )
             ),
-            nn.LeakyReLU(0.2),
+            act(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            sn(nn.Linear(channels * 4, 1)),
+            sn(nn.Linear(channels * 4, output_dim)),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(x.shape[0], 1, self.input_height, self.input_width)
         return self.net(x)
+
+
+class SetTransformerDiscriminator(nn.Module):
+    """Permutation-equivariant listwise discriminator over a candidate batch."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        model_dim: int = 128,
+        depth: int = 2,
+        heads: int = 4,
+        mlp_ratio: int = 2,
+        dropout: float = 0.0,
+        output_dim: int = 1,
+    ) -> None:
+        super().__init__()
+        if output_dim <= 0:
+            raise ValueError(f"output_dim must be positive, got {output_dim}")
+        if model_dim % heads != 0:
+            raise ValueError(
+                f"set transformer model_dim must be divisible by heads, got {model_dim} and {heads}"
+            )
+        self.input_proj = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, model_dim),
+            nn.GELU(),
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=heads,
+            dim_feedforward=mlp_ratio * model_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=depth)
+        self.score_head = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError(
+                f"SetTransformerDiscriminator expects 2D input, got {x.shape}"
+            )
+        tokens = self.input_proj(x).unsqueeze(0)
+        encoded = self.encoder(tokens).squeeze(0)
+        return self.score_head(encoded)
 
 
 @dataclass
@@ -145,24 +686,39 @@ class FEMConfig:
     poisson_ratio: float = 0.3
     volume_max: float = 0.48
     roughness_max: float = 0.18
+    connectivity_max: float | None = None
     volume_ladder: tuple[float, ...] = ()
     compliance_ladder: tuple[float, ...] = ()
     roughness_ladder: tuple[float, ...] = ()
+    connectivity_ladder: tuple[float, ...] = ()
     ladder_sequence: tuple[tuple[LadderKind, float], ...] = ()
     use_levels_ladder: bool = False
     levels_ladder_objectives: tuple[str, ...] = ()
     load_scale: float = 1.0
     load_case: LoadCase = "center_point"
+    robust_load_cases: tuple[LoadCase, ...] = ()
+    robust_load_aggregate: RobustLoadAggregate = "max"
+    robust_load_cvar_frac: float = 0.5
+    removal_ladder_volumes: tuple[float, ...] = ()
+    removal_ladder_compliances: tuple[float, ...] = ()
+    removal_ladder_connectivity_max: float | None = None
     fem_workers: int = 1
+    sorted_material_profile: SortedMaterialProfile = "linear"
+    sorted_material_steepness: float = 12.0
     density_filter_radius: int = 1
     projection_beta: float = 0.0
     projection_eta: float = 0.5
     hard_binarize: bool = False
+    binhead_connect_support: bool = False
     tiny_decoder_model: str = "madebyollin/taesd"
     tiny_decoder_latent_channels: int = 4
     tiny_decoder_latent_height: int = 8
     tiny_decoder_latent_width: int = 8
     tiny_decoder_latent_scale: float = 1.0
+    bar_count: int = 16
+    bar_width_min: float = 0.02
+    bar_width_max: float = 0.08
+    bar_edge_softness: float = 0.01
 
 
 def decode_design_logits_numpy(x: np.ndarray) -> np.ndarray:
@@ -264,6 +820,186 @@ def project_scores_to_topk_binary_numpy(scores: np.ndarray, k: int) -> np.ndarra
     return out
 
 
+def fixed_sorted_material_values_numpy(
+    n: int,
+    target_mean: float,
+    *,
+    profile: SortedMaterialProfile,
+    steepness: float = 12.0,
+) -> np.ndarray:
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    if not 0.0 <= target_mean <= 1.0:
+        raise ValueError(f"target_mean must be in [0, 1], got {target_mean}")
+    if profile == "binary":
+        k = int(round(target_mean * n))
+        values = np.zeros(n, dtype=np.float64)
+        values[:k] = 1.0
+        return values
+    if profile == "linear":
+        values = np.linspace(1.0, 0.0, n, dtype=np.float64)
+        mean = float(values.mean())
+        return np.clip(values * target_mean / max(mean, 1e-12), 0.0, 1.0)
+    if profile == "sigmoid":
+        if steepness <= 0:
+            raise ValueError(f"steepness must be positive, got {steepness}")
+        ranks = (np.arange(n, dtype=np.float64) + 0.5) / n
+        logits = -steepness * (ranks - target_mean)
+        values = 1.0 / (1.0 + np.exp(-logits))
+        lo = values.min()
+        hi = values.max()
+        if hi - lo > 1e-12:
+            values = (values - lo) / (hi - lo)
+        mean = float(values.mean())
+        return np.clip(values * target_mean / max(mean, 1e-12), 0.0, 1.0)
+    raise ValueError(f"Unknown sorted material profile: {profile}")
+
+
+def project_scores_to_fixed_sorted_material_numpy(
+    scores: np.ndarray,
+    material_values: np.ndarray,
+) -> np.ndarray:
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    values = np.asarray(material_values, dtype=np.float64).reshape(-1)
+    if scores.size != values.size:
+        raise ValueError(
+            f"scores and material_values must have same size, got {scores.size} and {values.size}"
+        )
+    order = np.argsort(-scores, kind="stable")
+    out = np.empty_like(scores, dtype=np.float64)
+    out[order] = values
+    return out
+
+
+def rasterize_bar_primitives_numpy(
+    params: np.ndarray,
+    *,
+    nely: int,
+    nelx: int,
+    width_min: float,
+    width_max: float,
+    edge_softness: float,
+) -> np.ndarray:
+    """Rasterize normalized line-segment primitives into density fields."""
+    if width_min <= 0:
+        raise ValueError(f"width_min must be positive, got {width_min}")
+    if width_max < width_min:
+        raise ValueError(
+            f"width_max must be >= width_min, got {width_max} < {width_min}"
+        )
+    if edge_softness <= 0:
+        raise ValueError(f"edge_softness must be positive, got {edge_softness}")
+
+    raw = np.asarray(params, dtype=np.float64)
+    if raw.ndim != 3 or raw.shape[-1] != 5:
+        raise ValueError(
+            f"bar params must have shape (batch, bars, 5), got {raw.shape}"
+        )
+
+    batch_size, bar_count, _ = raw.shape
+    xs = (np.arange(nelx, dtype=np.float64) + 0.5) / float(nelx)
+    ys = (np.arange(nely, dtype=np.float64) + 0.5) / float(nely)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    points = np.stack([grid_x, grid_y], axis=-1).reshape(1, 1, nely * nelx, 2)
+
+    coords = 1.0 / (1.0 + np.exp(-raw[..., :4]))
+    starts = coords[..., :2]
+    ends = coords[..., 2:4]
+    widths = width_min + (width_max - width_min) / (1.0 + np.exp(-raw[..., 4]))
+
+    segment = ends - starts
+    denom = np.sum(segment * segment, axis=-1, keepdims=True)
+    denom = np.maximum(denom, 1e-8)
+    rel = points - starts[:, :, None, :]
+    t = (
+        np.sum(rel * segment[:, :, None, :], axis=-1, keepdims=True)
+        / denom[:, :, None, :]
+    )
+    t = np.clip(t, 0.0, 1.0)
+    closest = starts[:, :, None, :] + t * segment[:, :, None, :]
+    dist = np.linalg.norm(points - closest, axis=-1)
+    logits = (widths[:, :, None] - dist) / edge_softness
+    bar_density = 1.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
+    density = np.max(bar_density, axis=1)
+    return density.reshape(batch_size, nely, nelx)
+
+
+def support_connected_mask_numpy(binary: np.ndarray) -> np.ndarray:
+    solid = np.asarray(binary, dtype=bool)
+    height, width = solid.shape
+    visited = np.zeros_like(solid, dtype=bool)
+    stack: list[tuple[int, int]] = [
+        (row, 0) for row in range(height) if bool(solid[row, 0])
+    ]
+    for row, col in stack:
+        visited[row, col] = True
+
+    while stack:
+        row, col = stack.pop()
+        for nr, nc in (
+            (row - 1, col),
+            (row + 1, col),
+            (row, col - 1),
+            (row, col + 1),
+        ):
+            if (
+                0 <= nr < height
+                and 0 <= nc < width
+                and bool(solid[nr, nc])
+                and not bool(visited[nr, nc])
+            ):
+                visited[nr, nc] = True
+                stack.append((nr, nc))
+    return visited
+
+
+def connect_support_and_refill_numpy(
+    binary: np.ndarray,
+    scores: np.ndarray,
+    *,
+    target_count: int,
+) -> np.ndarray:
+    """Keep support-connected material, then refill nearby high-score cells."""
+    solid = np.asarray(binary, dtype=np.float64) >= 0.5
+    score_grid = np.asarray(scores, dtype=np.float64).reshape(solid.shape)
+    target_count = min(max(target_count, 0), solid.size)
+    if target_count == 0:
+        return np.zeros_like(binary, dtype=np.float64)
+
+    connected = support_connected_mask_numpy(solid)
+    if not np.any(connected):
+        flat_scores = score_grid.reshape(-1)
+        start = int(np.argmax(flat_scores))
+        connected.reshape(-1)[start] = True
+
+    selected = connected.copy()
+    if int(np.count_nonzero(selected)) > target_count:
+        connected_scores = np.where(selected, score_grid, -np.inf).reshape(-1)
+        keep_idx = np.argpartition(connected_scores, -target_count)[-target_count:]
+        trimmed = np.zeros_like(selected)
+        trimmed.reshape(-1)[keep_idx] = True
+        selected = support_connected_mask_numpy(trimmed)
+
+    while int(np.count_nonzero(selected)) < target_count:
+        candidates = np.zeros_like(selected, dtype=bool)
+        candidates[:-1, :] |= selected[1:, :]
+        candidates[1:, :] |= selected[:-1, :]
+        candidates[:, :-1] |= selected[:, 1:]
+        candidates[:, 1:] |= selected[:, :-1]
+        candidates &= ~selected
+        if not np.any(candidates):
+            candidates = ~selected
+        candidate_scores = np.where(candidates, score_grid, -np.inf).reshape(-1)
+        next_idx = int(np.argmax(candidate_scores))
+        if not np.isfinite(candidate_scores[next_idx]):
+            break
+        selected.reshape(-1)[next_idx] = True
+
+    out = np.zeros_like(score_grid, dtype=np.float64)
+    out[selected] = 1.0
+    return out
+
+
 def project_scores_to_topk_binary_torch(scores: torch.Tensor, k: int) -> torch.Tensor:
     flat = scores.reshape(scores.shape[0], -1)
     out = torch.zeros_like(flat)
@@ -316,9 +1052,9 @@ def parse_ladder_sequence(specs: list[str]) -> tuple[tuple[LadderKind, float], .
             )
         kind_raw, value_raw = spec.split(":", 1)
         kind = kind_raw.strip().lower()
-        if kind not in {"volume", "compliance", "roughness"}:
+        if kind not in {"volume", "compliance", "roughness", "connectivity"}:
             raise ValueError(
-                f"Invalid ladder kind '{kind_raw}'. Expected one of volume, compliance, roughness"
+                f"Invalid ladder kind '{kind_raw}'. Expected one of volume, compliance, roughness, connectivity"
             )
         parsed.append((kind, float(value_raw)))
     return tuple(parsed)
@@ -326,7 +1062,7 @@ def parse_ladder_sequence(specs: list[str]) -> tuple[tuple[LadderKind, float], .
 
 def parse_levels_ladder_specs(specs: list[str]) -> list[Rung]:
     """Parse official Levels.ladder specs like compliance:130,110,100."""
-    allowed = {"volume", "roughness", "compliance"}
+    allowed = {"volume", "roughness", "compliance", "connectivity"}
     rungs: list[Rung] = []
     for spec in specs:
         parts = [part.strip() for part in spec.split(":")]
@@ -359,6 +1095,8 @@ def get_level_names(
     volume_ladder: list[float],
     compliance_ladder: list[float],
     roughness_ladder: list[float],
+    connectivity_ladder: list[float],
+    connectivity_max: float | None,
     ladder_sequence: tuple[tuple[LadderKind, float], ...],
 ) -> list[str]:
     names: list[str] = []
@@ -371,6 +1109,11 @@ def get_level_names(
             f"compliance_violation_le_{bound:g}" for bound in compliance_ladder
         )
         names.extend(f"roughness_violation_le_{bound:g}" for bound in roughness_ladder)
+        names.extend(
+            f"connectivity_violation_le_{bound:g}" for bound in connectivity_ladder
+        )
+    if connectivity_max is not None:
+        names.append("connectivity_violation")
     names.extend(["volume_violation", "roughness_violation", "compliance"])
     return names
 
@@ -414,6 +1157,9 @@ class FEMCantileverEvaluator:
 
     def __init__(self, config: FEMConfig) -> None:
         self.config = config
+        self._fem_executor: ThreadPoolExecutor | None = None
+        self._fem_executor_workers = 0
+        self.requires_connectivity = self._requires_connectivity_objective(config)
         self.nelx = config.grid_width
         self.nely = config.grid_height
         self._configure_code_shape()
@@ -426,15 +1172,67 @@ class FEMCantileverEvaluator:
         self.iK = np.kron(self.edof_mat, np.ones((8, 1), dtype=np.int32)).ravel()
         self.jK = np.kron(self.edof_mat, np.ones((1, 8), dtype=np.int32)).ravel()
         self.fixed_dofs, self.free_dofs = self._build_boundary_conditions()
-        self.force = self._build_force_vector()
+        self.n_free_dofs = int(len(self.free_dofs))
+        self._precompute_free_stiffness_entries()
+        self.force_cases = self._active_force_cases()
+        self.forces = tuple(
+            self._build_force_vector_for_case(load_case)
+            for load_case in self.force_cases
+        )
+        self.force = self.forces[0]
+        self.force_frees = tuple(force[self.free_dofs] for force in self.forces)
+        self.force_free = self.force_frees[0]
         self.filter_offsets, self.filter_weights = self._build_filter_kernel()
+        self.sorted_material_values = fixed_sorted_material_values_numpy(
+            self.nelems,
+            self.config.volume_max,
+            profile=self.config.sorted_material_profile,
+            steepness=self.config.sorted_material_steepness,
+        )
         self.solid_compliance = self._compute_solid_compliance()
+
+    def close(self) -> None:
+        """Release persistent FEM worker resources."""
+        if self._fem_executor is not None:
+            self._fem_executor.shutdown(wait=True)
+            self._fem_executor = None
+            self._fem_executor_workers = 0
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _get_fem_executor(self) -> ThreadPoolExecutor:
+        if (
+            self._fem_executor is None
+            or self._fem_executor_workers != self.config.fem_workers
+        ):
+            self.close()
+            self._fem_executor = ThreadPoolExecutor(max_workers=self.config.fem_workers)
+            self._fem_executor_workers = self.config.fem_workers
+        return self._fem_executor
+
+    def _requires_connectivity_objective(self, config: FEMConfig) -> bool:
+        if config.connectivity_max is not None or bool(config.connectivity_ladder):
+            return True
+        if any(kind == "connectivity" for kind, _bound in config.ladder_sequence):
+            return True
+        return (
+            config.use_levels_ladder
+            and "connectivity" in config.levels_ladder_objectives
+        )
 
     def _configure_code_shape(self) -> None:
         if self.config.encoding == "tiny_decoder":
             self.code_width = self.config.tiny_decoder_latent_width
             self.code_height = self.config.tiny_decoder_latent_height
             self.code_channels = self.config.tiny_decoder_latent_channels
+        elif self.config.encoding == "bar_primitives":
+            self.code_width = 5 * self.config.bar_count
+            self.code_height = 1
+            self.code_channels = 1
         else:
             self.code_width = self.config.coarse_grid_width or self.config.grid_width
             self.code_height = self.config.coarse_grid_height or self.config.grid_height
@@ -544,15 +1342,94 @@ class FEMCantileverEvaluator:
         free_dofs = np.setdiff1d(all_dofs, fixed_dofs)
         return fixed_dofs, free_dofs
 
+    def _precompute_free_stiffness_entries(self) -> None:
+        """Precompute reduced stiffness entries for repeated compliance solves."""
+        free_index = np.full(self.ndof, -1, dtype=np.int32)
+        free_index[self.free_dofs] = np.arange(self.n_free_dofs, dtype=np.int32)
+
+        reduced_i = free_index[self.iK]
+        reduced_j = free_index[self.jK]
+        free_mask = (reduced_i >= 0) & (reduced_j >= 0)
+
+        entry_elements = np.repeat(np.arange(self.nelems, dtype=np.int32), 64)
+        entry_ke = np.tile(self.ke.ravel(), self.nelems)
+
+        self.iK_free = reduced_i[free_mask]
+        self.jK_free = reduced_j[free_mask]
+        self.free_entry_elements = entry_elements[free_mask]
+        self.free_entry_ke = entry_ke[free_mask]
+
+    def _active_force_cases(self) -> tuple[LoadCase, ...]:
+        if not self.config.robust_load_cases:
+            return (self.config.load_case,)
+        force_cases = []
+        seen = set()
+        for load_case in self.config.robust_load_cases:
+            if load_case in seen:
+                continue
+            force_cases.append(load_case)
+            seen.add(load_case)
+        if not force_cases:
+            raise ValueError("--robust_load_cases must contain at least one load case")
+        return tuple(force_cases)
+
     def _build_force_vector(self) -> np.ndarray:
+        return self._build_force_vector_for_case(self.config.load_case)
+
+    def _build_force_vector_for_case(self, load_case: LoadCase) -> np.ndarray:
         force = np.zeros(self.ndof, dtype=np.float64)
-        if self.config.load_case == "tom_two_patches":
+        if load_case == "tom_two_patches":
             return self._build_tom_two_patch_force_vector(force)
-        if self.config.load_case != "center_point":
-            raise ValueError(f"Unknown load_case: {self.config.load_case}")
+        if load_case == "center_point":
+            return self._add_right_edge_point_load(force, self.nely // 2)
+        if load_case == "right_top_point":
+            return self._add_right_edge_point_load(force, self.nely)
+        if load_case == "right_bottom_point":
+            return self._add_right_edge_point_load(force, 0)
+        if load_case == "right_two_points":
+            force = self._add_right_edge_point_load(
+                force,
+                max(0, int(round(0.25 * self.nely))),
+                scale=0.5,
+            )
+            return self._add_right_edge_point_load(
+                force,
+                min(self.nely, int(round(0.75 * self.nely))),
+                scale=0.5,
+            )
+        if load_case == "right_edge_uniform":
+            return self._build_right_edge_uniform_force_vector(force)
+        if load_case == "right_edge_shear":
+            return self._build_right_edge_shear_force_vector(force)
+        raise ValueError(f"Unknown load_case: {load_case}")
+
+    def _add_right_edge_point_load(
+        self,
+        force: np.ndarray,
+        load_row: int,
+        *,
+        scale: float = 1.0,
+    ) -> np.ndarray:
+        load_row = min(max(load_row, 0), self.nely)
+        load_node = load_row * (self.nelx + 1) + self.nelx
+        force[2 * load_node + 1] += -scale * self.config.load_scale
+        return force
+
+    def _build_right_edge_uniform_force_vector(self, force: np.ndarray) -> np.ndarray:
+        """Uniform downward traction on the full free right edge."""
+        for row in range(self.nely):
+            lower_node = row * (self.nelx + 1) + self.nelx
+            upper_node = (row + 1) * (self.nelx + 1) + self.nelx
+            nodal_force = -0.5 * self.config.load_scale / self.nely
+            force[2 * lower_node + 1] += nodal_force
+            force[2 * upper_node + 1] += nodal_force
+        return force
+
+    def _build_right_edge_shear_force_vector(self, force: np.ndarray) -> np.ndarray:
+        """Horizontal shear at the center of the right edge."""
         load_row = self.nely // 2
         load_node = load_row * (self.nelx + 1) + self.nelx
-        force[2 * load_node + 1] = -self.config.load_scale
+        force[2 * load_node] = self.config.load_scale
         return force
 
     def _build_tom_two_patch_force_vector(self, force: np.ndarray) -> np.ndarray:
@@ -638,15 +1515,68 @@ class FEMCantileverEvaluator:
         ).tocsc()
         return (K + K.T) * 0.5
 
-    def _solve_compliance(self, density_phys: np.ndarray) -> float:
-        K = self._assemble_stiffness(density_phys)
-        K_ff = K[self.free_dofs][:, self.free_dofs]
-        u_f = spla.spsolve(K_ff, self.force[self.free_dofs])
-        compliance = float(self.force[self.free_dofs] @ u_f)
+    def _assemble_reduced_stiffness(self, density_phys: np.ndarray) -> sp.csc_matrix:
+        penalized = self.config.e_min + (
+            density_phys.ravel(order="C") ** self.config.simp_p
+        ) * (self.config.e_max - self.config.e_min)
+        sK = self.free_entry_ke * penalized[self.free_entry_elements]
+        return sp.coo_matrix(
+            (sK, (self.iK_free, self.jK_free)),
+            shape=(self.n_free_dofs, self.n_free_dofs),
+        ).tocsc()
+
+    def _solve_compliance_for_force(
+        self,
+        density_phys: np.ndarray,
+        force_free: np.ndarray,
+    ) -> float:
+        K_ff = self._assemble_reduced_stiffness(density_phys)
+        u_f = spla.spsolve(K_ff, force_free)
+        compliance = float(force_free @ u_f)
         return compliance
+
+    def _aggregate_compliances(self, compliances: list[float]) -> float:
+        if not compliances:
+            raise ValueError("Cannot aggregate an empty compliance list")
+        values = np.asarray(compliances, dtype=np.float64)
+        if self.config.robust_load_aggregate == "max":
+            return float(values.max())
+        if self.config.robust_load_aggregate == "mean":
+            return float(values.mean())
+        if self.config.robust_load_aggregate == "cvar":
+            count = max(
+                1,
+                int(math.ceil(self.config.robust_load_cvar_frac * len(values))),
+            )
+            return float(np.sort(values)[-count:].mean())
+        raise ValueError(
+            f"Unknown robust_load_aggregate: {self.config.robust_load_aggregate}"
+        )
+
+    def _solve_compliance(self, density_phys: np.ndarray) -> float:
+        if len(self.force_frees) == 1:
+            return self._solve_compliance_for_force(density_phys, self.force_free)
+
+        K_ff = self._assemble_reduced_stiffness(density_phys)
+        rhs = np.column_stack(self.force_frees)
+        displacements = spla.spsolve(K_ff, rhs)
+        if displacements.ndim == 1:
+            displacements = displacements[:, None]
+        compliances = np.sum(rhs * displacements, axis=0).astype(np.float64).tolist()
+        return self._aggregate_compliances(compliances)
+
+    def _finalize_density_sample(self, sample_raw: np.ndarray) -> np.ndarray:
+        sample = self._apply_density_filter(sample_raw.astype(np.float64, copy=False))
+        return apply_projection_numpy(
+            sample,
+            beta=self.config.projection_beta,
+            eta=self.config.projection_eta,
+            hard_binarize=self.config.hard_binarize,
+        )
 
     def decode_designs_numpy(self, x_np: np.ndarray) -> np.ndarray:
         x_np = np.asarray(x_np, dtype=np.float32)
+        binhead_scores: np.ndarray | None = None
 
         if self.config.encoding == "direct":
             x_phys = decode_design_logits_numpy(x_np).reshape(-1, self.nely, self.nelx)
@@ -689,10 +1619,23 @@ class FEMCantileverEvaluator:
             ).reshape(-1, self.nely, self.nelx)
         elif self.config.encoding == "topk_volume":
             final_scores = x_np.reshape(-1, self.nely * self.nelx)
+            binhead_scores = final_scores.reshape(-1, self.nely, self.nelx)
             k = int(round(self.config.volume_max * self.nely * self.nelx))
             x_phys = np.stack(
                 [
                     project_scores_to_topk_binary_numpy(sample, k)
+                    for sample in final_scores
+                ],
+                axis=0,
+            ).reshape(-1, self.nely, self.nelx)
+        elif self.config.encoding == "sorted_material":
+            final_scores = x_np.reshape(-1, self.nely * self.nelx)
+            binhead_scores = final_scores.reshape(-1, self.nely, self.nelx)
+            x_phys = np.stack(
+                [
+                    project_scores_to_fixed_sorted_material_numpy(
+                        sample, self.sorted_material_values
+                    )
                     for sample in final_scores
                 ],
                 axis=0,
@@ -709,6 +1652,7 @@ class FEMCantileverEvaluator:
                 full_width=self.nelx,
             )
             final_scores = upsampled_scores.reshape(-1, self.nely * self.nelx)
+            binhead_scores = final_scores.reshape(-1, self.nely, self.nelx)
             k = int(round(self.config.volume_max * self.nely * self.nelx))
             x_phys = np.stack(
                 [
@@ -740,21 +1684,33 @@ class FEMCantileverEvaluator:
             x_phys = decode_design_logits_numpy(combined_logits).reshape(
                 -1, self.nely, self.nelx
             )
+        elif self.config.encoding == "bar_primitives":
+            expected_dim = 5 * self.config.bar_count
+            if x_np.shape[-1] != expected_dim:
+                raise ValueError(
+                    f"bar_primitives expects output_dim={expected_dim}, got {x_np.shape[-1]}"
+                )
+            x_phys = rasterize_bar_primitives_numpy(
+                x_np.reshape(-1, self.config.bar_count, 5),
+                nely=self.nely,
+                nelx=self.nelx,
+                width_min=self.config.bar_width_min,
+                width_max=self.config.bar_width_max,
+                edge_softness=self.config.bar_edge_softness,
+            )
         else:
             raise ValueError(f"Unknown encoding mode: {self.config.encoding}")
 
         decoded = []
-        for sample_raw in x_phys.reshape(-1, self.nely, self.nelx):
-            sample = self._apply_density_filter(
-                sample_raw.astype(np.float64, copy=False)
-            )
-            sample = apply_projection_numpy(
-                sample,
-                beta=self.config.projection_beta,
-                eta=self.config.projection_eta,
-                hard_binarize=self.config.hard_binarize,
-            )
-            decoded.append(sample)
+        target_count = int(round(self.config.volume_max * self.nely * self.nelx))
+        for idx, sample_raw in enumerate(x_phys.reshape(-1, self.nely, self.nelx)):
+            if self.config.binhead_connect_support and binhead_scores is not None:
+                sample_raw = connect_support_and_refill_numpy(
+                    sample_raw,
+                    binhead_scores[idx],
+                    target_count=target_count,
+                )
+            decoded.append(self._finalize_density_sample(sample_raw))
         return np.asarray(decoded, dtype=np.float32)
 
     def decode_designs_torch(self, x: torch.Tensor) -> torch.Tensor:
@@ -826,21 +1782,114 @@ class FEMCantileverEvaluator:
         )
         return self._solve_compliance(solid)
 
-    def density_objectives(self, sample: np.ndarray) -> tuple[float, float, float]:
+    def disconnected_solid_fraction(self, sample: np.ndarray) -> float:
+        solid = sample >= self.config.projection_eta
+        total_solid = int(np.count_nonzero(solid))
+        if total_solid == 0:
+            return 1.0
+
+        visited = np.zeros_like(solid, dtype=bool)
+        stack: list[tuple[int, int]] = [
+            (row, 0) for row in range(self.nely) if bool(solid[row, 0])
+        ]
+        for row, col in stack:
+            visited[row, col] = True
+
+        connected = 0
+        while stack:
+            row, col = stack.pop()
+            connected += 1
+            for nr, nc in (
+                (row - 1, col),
+                (row + 1, col),
+                (row, col - 1),
+                (row, col + 1),
+            ):
+                if (
+                    0 <= nr < self.nely
+                    and 0 <= nc < self.nelx
+                    and bool(solid[nr, nc])
+                    and not bool(visited[nr, nc])
+                ):
+                    visited[nr, nc] = True
+                    stack.append((nr, nc))
+        return float(max(total_solid - connected, 0) / total_solid)
+
+    def density_objectives(
+        self, sample: np.ndarray
+    ) -> tuple[float, float, float, float]:
         volume = float(sample.mean())
         dx = float(np.abs(sample[:, 1:] - sample[:, :-1]).mean())
         dy = float(np.abs(sample[1:, :] - sample[:-1, :]).mean())
         roughness = 0.5 * (dx + dy)
+        connectivity = (
+            self.disconnected_solid_fraction(sample)
+            if self.requires_connectivity
+            else 0.0
+        )
         compliance = self._solve_compliance(sample)
-        return volume, roughness, compliance
+        return volume, roughness, connectivity, compliance
+
+    def removal_ladder_objectives(self, scores: np.ndarray) -> list[float]:
+        flat_scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        if flat_scores.size != self.nelems:
+            raise ValueError(
+                "removal ladder expects one priority score per element, got "
+                f"{flat_scores.size} scores for {self.nelems} elements"
+            )
+        volumes = self.config.removal_ladder_volumes
+        targets = self.config.removal_ladder_compliances
+        if not volumes:
+            raise ValueError("removal_ladder_objectives requires configured volumes")
+
+        compliances = []
+        connectivities = []
+        for volume_fraction in volumes:
+            k = int(round(volume_fraction * self.nelems))
+            sample_raw = project_scores_to_topk_binary_numpy(flat_scores, k).reshape(
+                self.nely,
+                self.nelx,
+            )
+            if self.config.binhead_connect_support:
+                sample_raw = connect_support_and_refill_numpy(
+                    sample_raw,
+                    flat_scores.reshape(self.nely, self.nelx),
+                    target_count=k,
+                )
+            sample = self._finalize_density_sample(sample_raw)
+            if self.config.removal_ladder_connectivity_max is not None:
+                connectivities.append(self.disconnected_solid_fraction(sample))
+            compliances.append(self._solve_compliance(sample))
+
+        connectivity_max = self.config.removal_ladder_connectivity_max
+        if targets:
+            values = []
+            for idx, (compliance, target) in enumerate(
+                zip(compliances, targets, strict=True)
+            ):
+                if connectivity_max is not None:
+                    values.append(max(connectivities[idx] - connectivity_max, 0.0))
+                values.append(max(compliance - target, 0.0))
+            # Keep the final three columns compatible with the existing
+            # volume/roughness/compliance summary machinery.
+            values.extend([0.0, 0.0, float(compliances[-1])])
+            return values
+        values = []
+        for idx, compliance in enumerate(compliances):
+            if connectivity_max is not None:
+                values.append(max(connectivities[idx] - connectivity_max, 0.0))
+            values.append(float(compliance))
+        values.extend([0.0, 0.0, float(compliances[-1])])
+        return values
 
     def _format_objective_values(
-        self, volume: float, roughness: float, compliance: float
+        self, volume: float, roughness: float, connectivity: float, compliance: float
     ) -> list[float]:
         if self.config.use_levels_ladder:
             objective_values = {
                 "volume": volume,
                 "roughness": roughness,
+                "connectivity": connectivity,
                 "compliance": compliance,
             }
             return [
@@ -856,6 +1905,8 @@ class FEMCantileverEvaluator:
                     level_values.append(max(compliance - bound, 0.0))
                 elif kind == "roughness":
                     level_values.append(max(roughness - bound, 0.0))
+                elif kind == "connectivity":
+                    level_values.append(max(connectivity - bound, 0.0))
                 else:
                     raise ValueError(f"Unknown ladder kind: {kind}")
         else:
@@ -865,6 +1916,10 @@ class FEMCantileverEvaluator:
                 level_values.append(max(compliance - bound, 0.0))
             for bound in self.config.roughness_ladder:
                 level_values.append(max(roughness - bound, 0.0))
+            for bound in self.config.connectivity_ladder:
+                level_values.append(max(connectivity - bound, 0.0))
+        if self.config.connectivity_max is not None:
+            level_values.append(max(connectivity - self.config.connectivity_max, 0.0))
         level_values.extend(
             [
                 max(volume - self.config.volume_max, 0.0),
@@ -879,12 +1934,19 @@ class FEMCantileverEvaluator:
         if self.config.fem_workers <= 1 or len(samples) <= 1:
             objectives = [self.density_objectives(sample) for sample in samples]
         else:
-            with ThreadPoolExecutor(max_workers=self.config.fem_workers) as pool:
-                objectives = list(pool.map(self.density_objectives, samples))
+            pool = self._get_fem_executor()
+            objectives = list(pool.map(self.density_objectives, samples))
         return [
-            self._format_objective_values(volume, roughness, compliance)
-            for volume, roughness, compliance in objectives
+            self._format_objective_values(volume, roughness, connectivity, compliance)
+            for volume, roughness, connectivity, compliance in objectives
         ]
+
+    def evaluate_removal_ladder_numpy(self, x_np: np.ndarray) -> list[list[float]]:
+        scores = np.asarray(x_np, dtype=np.float32).reshape(-1, self.nelems)
+        if self.config.fem_workers <= 1 or len(scores) <= 1:
+            return [self.removal_ladder_objectives(sample) for sample in scores]
+        pool = self._get_fem_executor()
+        return list(pool.map(self.removal_ladder_objectives, scores))
 
     def __call__(self, theta: torch.Tensor | np.ndarray) -> list[list[float]]:
         if isinstance(theta, torch.Tensor):
@@ -892,6 +1954,8 @@ class FEMCantileverEvaluator:
         else:
             x_np = np.asarray(theta, dtype=np.float32)
 
+        if self.config.removal_ladder_volumes:
+            return self.evaluate_removal_ladder_numpy(x_np)
         return self.evaluate_densities_numpy(self.decode_designs_numpy(x_np))
 
 
@@ -923,6 +1987,12 @@ class TorchFEMCantileverEvaluator(FEMCantileverEvaluator):
         self.Planar = Planar
         self.material_class = IsotropicElasticityPlaneStress
         self.filter_offsets, self.filter_weights = self._build_filter_kernel()
+        self.sorted_material_values = fixed_sorted_material_values_numpy(
+            self.nelems,
+            self.config.volume_max,
+            profile=self.config.sorted_material_profile,
+            steepness=self.config.sorted_material_steepness,
+        )
         self.solid_compliance = self._compute_solid_compliance()
         torch.set_default_dtype(prev_dtype)
 
@@ -976,6 +2046,111 @@ def pairwise_hamming_mean(designs: torch.Tensor, threshold: float = 0.5) -> floa
     return float(diffs[triu[0], triu[1]].mean().item())
 
 
+class DiverseEliteBuffer:
+    """Buffer wrapper that keeps a ranked but Hamming-diverse elite set."""
+
+    def __init__(
+        self,
+        inner: Buffer,
+        *,
+        min_hamming: float,
+        topk_frac: float,
+    ) -> None:
+        if min_hamming < 0:
+            raise ValueError(f"min_hamming must be non-negative, got {min_hamming}")
+        if not 0.0 < topk_frac < 1.0:
+            raise ValueError(f"topk_frac must be in (0, 1), got {topk_frac}")
+        self.inner = inner
+        self.min_hamming = min_hamming
+        self.topk_frac = topk_frac
+        self.buffer_size = inner.buffer_size
+        self.value_levels = inner.value_levels
+
+    def _binary_order_proxy(self, tensors: list[torch.Tensor]) -> torch.Tensor:
+        flat = torch.stack([tensor.reshape(-1).to(torch.float32) for tensor in tensors])
+        k = int(round(self.topk_frac * flat.shape[1]))
+        k = min(max(k, 1), flat.shape[1])
+        top_idx = torch.topk(flat, k=k, dim=1).indices
+        proxy = torch.zeros_like(flat, dtype=torch.bool)
+        proxy.scatter_(1, top_idx, True)
+        return proxy
+
+    def _current_entries(self) -> list[tuple[list[float], torch.Tensor]]:
+        return [
+            ([float(v) for v in value], self.inner.get(idx).detach().clone())
+            for idx, value in enumerate(self.inner.get_sorted_values())
+        ]
+
+    def _select_diverse_entries(
+        self,
+        entries: list[tuple[list[float], torch.Tensor]],
+    ) -> list[tuple[list[float], torch.Tensor]]:
+        entries.sort(key=lambda entry: tuple(entry[0]))
+        target_size = min(self.buffer_size, len(entries))
+        proxies = self._binary_order_proxy([tensor for _value, tensor in entries])
+        selected: list[int] = []
+        selected_mask = torch.zeros(len(entries), dtype=torch.bool)
+        for idx in range(len(entries)):
+            if not selected:
+                selected.append(idx)
+                selected_mask[idx] = True
+            else:
+                distances = (proxies[selected] != proxies[idx]).float().mean(dim=1)
+                if float(distances.min().item()) >= self.min_hamming:
+                    selected.append(idx)
+                    selected_mask[idx] = True
+            if len(selected) >= target_size:
+                break
+
+        # Always fill the buffer by rank if the diversity constraint is too strict.
+        if len(selected) < target_size:
+            for idx in range(len(entries)):
+                if not bool(selected_mask[idx]):
+                    selected.append(idx)
+                if len(selected) >= target_size:
+                    break
+        return [entries[idx] for idx in selected[:target_size]]
+
+    def insert(self, tensor: torch.Tensor, value: float | list[float]) -> None:
+        self.insert_many(tensors=[tensor], values=[value])
+
+    def insert_many(
+        self,
+        tensors: list[torch.Tensor],
+        values: list[float] | list[list[float]],
+    ) -> None:
+        if self.min_hamming <= 0:
+            self.inner.insert_many(tensors=tensors, values=values)
+            return
+        tensor_list = [tensor.detach().clone() for tensor in tensors]
+        normalized_values = self.inner._normalize_many_values(tensor_list, values)
+        new_entries = [
+            (
+                [float(v) for v in value]
+                if isinstance(value, list | tuple)
+                else [float(value)],
+                tensor,
+            )
+            for tensor, value in zip(tensor_list, normalized_values)
+        ]
+        entries = self._current_entries() + new_entries
+        selected_entries = self._select_diverse_entries(entries)
+        self.inner.clear()
+        self.inner.insert_many(
+            tensors=[tensor for _value, tensor in selected_entries],
+            values=[value for value, _tensor in selected_entries],
+        )
+
+    def __len__(self) -> int:
+        return len(self.inner)
+
+    def len(self) -> int:
+        return len(self.inner)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
 def save_design_grid(
     designs: torch.Tensor,
     actual_compliance: np.ndarray,
@@ -1006,6 +2181,53 @@ def save_design_grid(
                 f"comp={actual_compliance[idx]:.3f}\nrel={relative_compliance[idx]:.3f}"
             ),
             fontsize=9,
+        )
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_best_design_history_grid(
+    design_history: np.ndarray,
+    value_history: np.ndarray,
+    iterations: np.ndarray,
+    output_path: Path,
+    *,
+    title: str,
+    max_frames: int = 24,
+) -> None:
+    """Save a compact visual timeline of the best decoded design."""
+    if design_history.size == 0:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    n_frames = int(design_history.shape[0])
+    if n_frames > max_frames:
+        frame_idx = np.linspace(0, n_frames - 1, max_frames, dtype=np.int32)
+    else:
+        frame_idx = np.arange(n_frames, dtype=np.int32)
+
+    cols = min(6, len(frame_idx))
+    rows = int(np.ceil(len(frame_idx) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(2.6 * cols, 2.8 * rows))
+    axes = np.atleast_1d(axes).reshape(rows, cols)
+
+    for plot_idx in range(rows * cols):
+        ax = axes[plot_idx // cols, plot_idx % cols]
+        if plot_idx >= len(frame_idx):
+            ax.axis("off")
+            continue
+        history_idx = int(frame_idx[plot_idx])
+        design = design_history[history_idx, 0]
+        values = value_history[history_idx, 0]
+        compliance = float(values[-1]) if values.size else float("nan")
+        ax.imshow(design, cmap="gray_r", vmin=0.0, vmax=1.0)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(
+            f"iter={int(iterations[history_idx])}\ncomp={compliance:.3f}",
+            fontsize=8,
         )
 
     fig.suptitle(title)
@@ -1145,6 +2367,108 @@ class TopologySpaceUniformity(torch.nn.Module):
         return sched_value * self.weight * uniformity_loss(decoded, t=self.t)
 
 
+class PlummerEmbeddingRepulsion(torch.nn.Module):
+    """Differentiable inverse-power repulsion on generated genome vectors."""
+
+    def __init__(
+        self,
+        *,
+        buffer: Any | None,
+        weight: float,
+        power: float = 1.0,
+        eps: float = 1e-3,
+        normalize: str = "layernorm",
+        terms: str = "batch_buffer",
+        use_buffer: bool = True,
+        scheduler: Scheduler | None = None,
+    ) -> None:
+        super().__init__()
+        if weight < 0:
+            raise ValueError(f"weight must be non-negative, got {weight}")
+        if power <= 0:
+            raise ValueError(f"plummer power must be positive, got {power}")
+        if eps <= 0:
+            raise ValueError(f"plummer eps must be positive, got {eps}")
+        if normalize not in {"none", "layernorm", "l2"}:
+            raise ValueError(
+                "plummer normalize must be one of none, layernorm, l2; "
+                f"got {normalize}"
+            )
+        if terms not in {"batch", "buffer", "batch_buffer"}:
+            raise ValueError(
+                "plummer terms must be one of batch, buffer, batch_buffer; "
+                f"got {terms}"
+            )
+        self.buffer = buffer
+        self.weight = weight
+        self.power = power
+        self.eps = eps
+        self.normalize = normalize
+        self.terms = terms
+        self.use_buffer = use_buffer
+        self.scheduler = scheduler
+
+    def _embed(self, x: torch.Tensor) -> torch.Tensor:
+        flat = x.reshape(x.shape[0], -1)
+        if self.normalize == "none":
+            return flat
+        if self.normalize == "l2":
+            return F.normalize(flat, p=2, dim=1, eps=self.eps)
+        mean = flat.mean(dim=1, keepdim=True)
+        std = flat.std(dim=1, keepdim=True, unbiased=False).clamp_min(self.eps)
+        return (flat - mean) / std
+
+    def _repulsion(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        exclude_diagonal: bool,
+    ) -> torch.Tensor:
+        if a.numel() == 0 or b.numel() == 0:
+            return torch.zeros((), device=a.device, dtype=a.dtype)
+        if exclude_diagonal and a.shape[0] < 2:
+            return torch.zeros((), device=a.device, dtype=a.dtype)
+
+        dist2 = torch.cdist(a, b, p=2).pow(2) / float(a.shape[1])
+        kernel = (self.eps + dist2).pow(-0.5 * self.power)
+        if exclude_diagonal:
+            keep = ~torch.eye(a.shape[0], device=a.device, dtype=torch.bool)
+            kernel = kernel[keep]
+        return kernel.mean()
+
+    def forward(self, g_out: torch.Tensor) -> torch.Tensor:
+        generated = self._embed(g_out)
+        loss = torch.zeros((), device=g_out.device, dtype=g_out.dtype)
+        if self.terms in {"batch", "batch_buffer"}:
+            loss = loss + self._repulsion(
+                generated,
+                generated,
+                exclude_diagonal=True,
+            )
+
+        if (
+            self.terms in {"buffer", "batch_buffer"}
+            and self.use_buffer
+            and self.buffer is not None
+            and len(self.buffer) > 0
+        ):
+            k = min(g_out.shape[0], len(self.buffer))
+            elite_raw = self.buffer.get_top_k(k).to(
+                device=g_out.device,
+                dtype=g_out.dtype,
+            )
+            elite = self._embed(elite_raw).detach()
+            loss = loss + self._repulsion(
+                generated,
+                elite,
+                exclude_diagonal=False,
+            )
+
+        sched_value = self.scheduler.step() if self.scheduler else 1.0
+        return sched_value * self.weight * loss
+
+
 def lexicographic_order(values: list[list[float]]) -> list[int]:
     return sorted(range(len(values)), key=lambda idx: tuple(values[idx]))
 
@@ -1155,6 +2479,31 @@ def plackett_luce_loss(scores_best_to_worst: torch.Tensor) -> torch.Tensor:
         return torch.zeros((), device=scores.device, dtype=scores.dtype)
     log_denoms = torch.logcumsumexp(scores.flip(0), dim=0).flip(0)
     return -(scores - log_denoms).mean()
+
+
+def contextual_plackett_luce_generator_loss(
+    proposal_scores: torch.Tensor,
+    context_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Loss for making each proposal rank above an evaluated context list."""
+    proposals = proposal_scores.reshape(-1)
+    context = context_scores.reshape(-1).detach()
+    if proposals.numel() == 0:
+        return torch.zeros(
+            (), device=proposal_scores.device, dtype=proposal_scores.dtype
+        )
+    if context.numel() == 0:
+        return -proposals.mean()
+    joint_scores = torch.cat(
+        [
+            proposals[:, None],
+            context.to(device=proposals.device, dtype=proposals.dtype)
+            .reshape(1, -1)
+            .expand(proposals.shape[0], -1),
+        ],
+        dim=1,
+    )
+    return -(proposals - torch.logsumexp(joint_scores, dim=1)).mean()
 
 
 def rank_targets(
@@ -1177,6 +2526,53 @@ def rank_targets(
             raise ValueError(f"ranker_tau must be positive, got {tau}")
         return torch.exp(-ranks / tau)
     raise ValueError(f"Unknown rank target curve: {curve}")
+
+
+def utility_targets_from_values(
+    values: list[list[float]] | np.ndarray,
+    *,
+    scale: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Map evaluated objective values to calibrated utilities."""
+    if scale <= 0:
+        raise ValueError(f"utility scale must be positive, got {scale}")
+    values_array = np.asarray(values, dtype=np.float32)
+    if values_array.ndim == 1:
+        values_array = values_array[:, None]
+    utilities = -values_array[:, -1] / float(scale)
+    return torch.as_tensor(utilities, device=device, dtype=dtype)
+
+
+def log_compliance_utility_targets(
+    compliance: torch.Tensor,
+    *,
+    reference: float,
+    clip: float,
+) -> torch.Tensor:
+    """Map compliance to bounded utility; higher is better."""
+    if reference <= 0:
+        raise ValueError(f"utility_target_scale must be positive, got {reference}")
+    targets = -torch.log(torch.clamp(compliance / reference, min=1e-8))
+    if clip > 0:
+        targets = torch.clamp(targets, min=-clip, max=clip)
+    return targets
+
+
+def split_rank_value_scores(scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a two-head discriminator output into rank and value scores."""
+    if scores.ndim == 1:
+        raise ValueError(
+            "Value-augmented ranker requires discriminator output_dim >= 2, "
+            f"got 1D output with shape {tuple(scores.shape)}"
+        )
+    if scores.shape[-1] < 2:
+        raise ValueError(
+            "Value-augmented ranker requires discriminator output_dim >= 2, "
+            f"got shape {tuple(scores.shape)}"
+        )
+    return scores[..., :1], scores[..., 1:2]
 
 
 class EvaluatedArchive:
@@ -1214,6 +2610,48 @@ class EvaluatedArchive:
         return torch.stack([self.tensors[i] for i in ranked_idx]).to(device, dtype)
 
 
+class GenomeArchive:
+    """Replay archive containing generated genome vectors and objective values."""
+
+    def __init__(self, max_size: int | None = None) -> None:
+        self.max_size = max_size
+        self.genomes: list[torch.Tensor] = []
+        self.values: list[list[float]] = []
+
+    def add_many(self, genomes: torch.Tensor, values: list[list[float]]) -> None:
+        for genome, value in zip(genomes.detach().cpu(), values, strict=True):
+            self.genomes.append(genome.clone())
+            self.values.append([float(v) for v in value])
+        if self.max_size is not None and len(self.genomes) > self.max_size:
+            ranked_idx = sorted(
+                range(len(self.genomes)), key=lambda i: tuple(self.values[i])
+            )
+            keep_idx = set(ranked_idx[: self.max_size])
+            self.genomes = [g for i, g in enumerate(self.genomes) if i in keep_idx]
+            self.values = [v for i, v in enumerate(self.values) if i in keep_idx]
+
+    def __len__(self) -> int:
+        return len(self.genomes)
+
+    def sample_elite(
+        self,
+        k: int,
+        *,
+        pool_size: int | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if len(self.genomes) == 0:
+            raise RuntimeError("Cannot sample from an empty genome archive")
+        ranked_idx = sorted(
+            range(len(self.genomes)), key=lambda i: tuple(self.values[i])
+        )
+        pool = ranked_idx[: min(len(ranked_idx), pool_size or len(ranked_idx))]
+        k = min(k, len(pool))
+        chosen = torch.randperm(len(pool))[:k].tolist()
+        return torch.stack([self.genomes[pool[i]] for i in chosen]).to(device, dtype)
+
+
 class PlackettLuceRankerOpt(BaseOpt):
     """GFog variant that trains D as a listwise ranker over evaluated samples."""
 
@@ -1233,6 +2671,23 @@ class PlackettLuceRankerOpt(BaseOpt):
         super().__init__(components)
 
     def evaluate(self, proposals: torch.Tensor) -> None:
+        proposals, keep_idx = self._reject_exact_buffer_design_duplicates(
+            proposals.detach()
+        )
+        if (
+            keep_idx is not None
+            and self._pending_genomes is not None
+            and self._pending_genomes.shape[0] >= int(keep_idx.numel())
+        ):
+            self._pending_genomes = self._pending_genomes.index_select(
+                0,
+                keep_idx.to(self._pending_genomes.device),
+            )
+        if proposals.shape[0] == 0:
+            self._last_evaluated_tensors = None
+            self._last_evaluated_values = []
+            self._pending_genomes = None
+            return
         values = self.fn.f(proposals.detach().to(self.fn.device, self.fn.dtype))
         value_list = [list(v) for v in values]
         detached = proposals.detach()
@@ -1288,10 +2743,42 @@ class BufferPlackettLuceRankerOpt(BaseOpt):
         generator_elite_margin: bool = False,
         ranker_sample_pool_size: int | None = None,
         ranker_sample_mode: str = "random_top_pool",
+        proposal_pool_size: int | None = None,
+        proposal_top_k: int | None = None,
+        proposal_diversity_min_hamming: float = 0.0,
+        proposal_diversity_topk_frac: float = 0.48,
+        proposal_buffer_novelty_min_hamming: float = 0.0,
+        proposal_buffer_novelty_reference_size: int = 128,
+        proposal_buffer_reject_exact_design_duplicates: bool = False,
+        design_proxy: DesignProxyFn | None = None,
+        proposal_evolution_fraction: float = 0.0,
+        proposal_evolution_parent_source: str = "pool",
+        proposal_evolution_crossover: str = "uniform",
+        proposal_evolution_mutation_rate: float = 0.01,
+        proposal_evolution_mutation_scale: float = 0.10,
+        proposal_evolution_grid_height: int | None = None,
+        proposal_evolution_grid_width: int | None = None,
+        proposal_gradient_steps: int = 0,
+        proposal_gradient_step_size: float = 0.05,
+        proposal_gradient_mode: str = "continuous",
+        proposal_gradient_normalize: bool = True,
+        proposal_gradient_noise: float = 0.0,
+        proposal_gradient_keep_original: bool = False,
+        ga_offspring_fraction: float = 0.0,
+        ga_pool_size: int | None = None,
+        ga_parent_pool_size: int = 128,
+        ga_mutation_rate: float = 0.02,
+        ga_mutation_scale: float = 0.25,
+        generator_elite_context_size: int = 0,
+        generator_elite_context_pool_size: int | None = None,
     ) -> None:
         self.ranker_list_size = ranker_list_size
         self.ranker_steps = ranker_steps
         self.generator_elite_margin = generator_elite_margin
+        self.genome_archive = GenomeArchive(
+            max_size=components.buffer.B.buffer_size * 4
+        )
+        self._pending_genomes: torch.Tensor | None = None
         self.ranker_sample_pool_size = ranker_sample_pool_size
         if ranker_sample_mode not in {"random_top_pool", "top_k"}:
             raise ValueError(
@@ -1299,7 +2786,176 @@ class BufferPlackettLuceRankerOpt(BaseOpt):
                 f"got {ranker_sample_mode}"
             )
         self.ranker_sample_mode = ranker_sample_mode
+        self.proposal_pool_size = proposal_pool_size
+        self.proposal_top_k = proposal_top_k
+        if proposal_diversity_min_hamming < 0:
+            raise ValueError(
+                "proposal_diversity_min_hamming must be non-negative, "
+                f"got {proposal_diversity_min_hamming}"
+            )
+        if not 0.0 < proposal_diversity_topk_frac < 1.0:
+            raise ValueError(
+                "proposal_diversity_topk_frac must be in (0, 1), "
+                f"got {proposal_diversity_topk_frac}"
+            )
+        self.proposal_diversity_min_hamming = proposal_diversity_min_hamming
+        self.proposal_diversity_topk_frac = proposal_diversity_topk_frac
+        if proposal_buffer_novelty_min_hamming < 0:
+            raise ValueError(
+                "proposal_buffer_novelty_min_hamming must be non-negative, "
+                f"got {proposal_buffer_novelty_min_hamming}"
+            )
+        if proposal_buffer_novelty_reference_size < 1:
+            raise ValueError(
+                "proposal_buffer_novelty_reference_size must be >= 1, "
+                f"got {proposal_buffer_novelty_reference_size}"
+            )
+        self.proposal_buffer_novelty_min_hamming = proposal_buffer_novelty_min_hamming
+        self.proposal_buffer_novelty_reference_size = (
+            proposal_buffer_novelty_reference_size
+        )
+        self.proposal_buffer_reject_exact_design_duplicates = (
+            proposal_buffer_reject_exact_design_duplicates
+        )
+        self.design_proxy = design_proxy
+        if not 0.0 <= proposal_evolution_fraction <= 1.0:
+            raise ValueError(
+                "proposal_evolution_fraction must be in [0, 1], "
+                f"got {proposal_evolution_fraction}"
+            )
+        if proposal_evolution_parent_source not in {"pool", "pool_buffer"}:
+            raise ValueError(
+                "proposal_evolution_parent_source must be one of pool, pool_buffer; "
+                f"got {proposal_evolution_parent_source}"
+            )
+        if proposal_evolution_crossover not in {"uniform", "row", "rect"}:
+            raise ValueError(
+                "proposal_evolution_crossover must be one of uniform, row, rect; "
+                f"got {proposal_evolution_crossover}"
+            )
+        if not 0.0 <= proposal_evolution_mutation_rate <= 1.0:
+            raise ValueError(
+                "proposal_evolution_mutation_rate must be in [0, 1], "
+                f"got {proposal_evolution_mutation_rate}"
+            )
+        if proposal_evolution_mutation_scale < 0:
+            raise ValueError(
+                "proposal_evolution_mutation_scale must be non-negative, "
+                f"got {proposal_evolution_mutation_scale}"
+            )
+        self.proposal_evolution_fraction = proposal_evolution_fraction
+        self.proposal_evolution_parent_source = proposal_evolution_parent_source
+        self.proposal_evolution_crossover = proposal_evolution_crossover
+        self.proposal_evolution_mutation_rate = proposal_evolution_mutation_rate
+        self.proposal_evolution_mutation_scale = proposal_evolution_mutation_scale
+        self.proposal_evolution_grid_height = proposal_evolution_grid_height
+        self.proposal_evolution_grid_width = proposal_evolution_grid_width
+        if proposal_gradient_steps < 0:
+            raise ValueError(
+                "proposal_gradient_steps must be non-negative, "
+                f"got {proposal_gradient_steps}"
+            )
+        if proposal_gradient_step_size < 0:
+            raise ValueError(
+                "proposal_gradient_step_size must be non-negative, "
+                f"got {proposal_gradient_step_size}"
+            )
+        if proposal_gradient_noise < 0:
+            raise ValueError(
+                "proposal_gradient_noise must be non-negative, "
+                f"got {proposal_gradient_noise}"
+            )
+        if proposal_gradient_mode not in {"continuous", "swap"}:
+            raise ValueError(
+                "proposal_gradient_mode must be one of continuous, swap; "
+                f"got {proposal_gradient_mode}"
+            )
+        self.proposal_gradient_steps = proposal_gradient_steps
+        self.proposal_gradient_step_size = proposal_gradient_step_size
+        self.proposal_gradient_mode = proposal_gradient_mode
+        self.proposal_gradient_normalize = proposal_gradient_normalize
+        self.proposal_gradient_noise = proposal_gradient_noise
+        self.proposal_gradient_keep_original = proposal_gradient_keep_original
+        if not 0.0 <= ga_offspring_fraction <= 1.0:
+            raise ValueError(
+                "ga_offspring_fraction must be in [0, 1], "
+                f"got {ga_offspring_fraction}"
+            )
+        if ga_parent_pool_size < 2:
+            raise ValueError(
+                f"ga_parent_pool_size must be >= 2, got {ga_parent_pool_size}"
+            )
+        if not 0.0 <= ga_mutation_rate <= 1.0:
+            raise ValueError(
+                f"ga_mutation_rate must be in [0, 1], got {ga_mutation_rate}"
+            )
+        if ga_mutation_scale < 0:
+            raise ValueError(
+                f"ga_mutation_scale must be non-negative, got {ga_mutation_scale}"
+            )
+        self.ga_offspring_fraction = ga_offspring_fraction
+        self.ga_pool_size = ga_pool_size
+        self.ga_parent_pool_size = ga_parent_pool_size
+        self.ga_mutation_rate = ga_mutation_rate
+        self.ga_mutation_scale = ga_mutation_scale
+        if generator_elite_context_size < 0:
+            raise ValueError(
+                "generator_elite_context_size must be non-negative, "
+                f"got {generator_elite_context_size}"
+            )
+        if (
+            generator_elite_context_pool_size is not None
+            and generator_elite_context_pool_size < 2
+        ):
+            raise ValueError(
+                "generator_elite_context_pool_size must be >= 2 when set, "
+                f"got {generator_elite_context_pool_size}"
+            )
+        self.generator_elite_context_size = generator_elite_context_size
+        self.generator_elite_context_pool_size = generator_elite_context_pool_size
         super().__init__(components)
+
+    def _set_generator_elite_context(self) -> None:
+        if not hasattr(self.gan.G, "set_elite_context"):
+            return
+        if self.generator_elite_context_size <= 0 or len(self.genome_archive) < 2:
+            self.gan.G.set_elite_context(None)
+            return
+        context = self.genome_archive.sample_elite(
+            self.generator_elite_context_size,
+            pool_size=self.generator_elite_context_pool_size,
+            device=self.gan.device,
+            dtype=self.gan.dtype,
+        )
+        self.gan.G.set_elite_context(context)
+
+    def _clear_generator_elite_context(self) -> None:
+        if hasattr(self.gan.G, "set_elite_context"):
+            self.gan.G.set_elite_context(None)
+
+    def _generate(
+        self,
+        z: torch.Tensor,
+        *,
+        use_elite_context: bool = True,
+        track_genomes: bool = False,
+    ) -> torch.Tensor:
+        if use_elite_context:
+            self._set_generator_elite_context()
+        else:
+            self._clear_generator_elite_context()
+        try:
+            proposals = self.gan.G(z)
+            if track_genomes and hasattr(self.gan.G, "last_genomes"):
+                last_genomes = self.gan.G.last_genomes
+                self._pending_genomes = (
+                    None if last_genomes is None else last_genomes.detach()
+                )
+            elif track_genomes:
+                self._pending_genomes = None
+            return proposals
+        finally:
+            self._clear_generator_elite_context()
 
     def _ranked_buffer_subset_with_positions(
         self, k: int
@@ -1343,6 +2999,390 @@ class BufferPlackettLuceRankerOpt(BaseOpt):
         ranked, _ = self._ranked_buffer_subset_with_positions(k)
         return ranked
 
+    def _sample_latents(self, batch_size: int) -> torch.Tensor:
+        latent_dim = self.gan.latent_dim
+        if not isinstance(latent_dim, int):
+            raise ValueError(
+                "proposal pool selection currently requires int latent_dim"
+            )
+        return torch.randn(
+            batch_size,
+            latent_dim,
+            device=self.gan.device,
+            dtype=self.gan.dtype,
+        )
+
+    def _binary_order_proxy(self, candidates: torch.Tensor) -> torch.Tensor:
+        flat = candidates.reshape(candidates.shape[0], -1)
+        k = int(round(self.proposal_diversity_topk_frac * flat.shape[1]))
+        k = min(max(k, 1), flat.shape[1])
+        top_idx = torch.topk(flat, k=k, dim=1).indices
+        proxy = torch.zeros_like(flat)
+        proxy.scatter_(1, top_idx, 1.0)
+        return proxy
+
+    def _design_proxy(self, candidates: torch.Tensor) -> torch.Tensor:
+        if self.design_proxy is None:
+            return self._binary_order_proxy(candidates).to(torch.bool)
+        proxy = self.design_proxy(candidates.detach().cpu())
+        if proxy.shape[0] != candidates.shape[0]:
+            raise ValueError(
+                "design_proxy must return one proxy per candidate, got "
+                f"{proxy.shape[0]} for {candidates.shape[0]}"
+            )
+        return proxy.reshape(proxy.shape[0], -1).to(torch.bool)
+
+    def _buffer_design_proxy(self) -> torch.Tensor | None:
+        if (
+            (
+                self.proposal_buffer_novelty_min_hamming <= 0
+                and not self.proposal_buffer_reject_exact_design_duplicates
+            )
+            or self.design_proxy is None
+            or len(self.buffer.B) == 0
+        ):
+            return None
+        reference_size = min(
+            self.proposal_buffer_novelty_reference_size,
+            len(self.buffer.B),
+        )
+        reference = self.buffer.B.get_top_k(reference_size).detach().cpu()
+        return self._design_proxy(reference)
+
+    def _select_diverse_ranked_candidates(
+        self, candidates: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size = self.components.batch_size
+        if candidates.shape[0] <= batch_size:
+            return candidates
+        if (
+            self.proposal_diversity_min_hamming <= 0
+            and self.proposal_buffer_novelty_min_hamming <= 0
+            and not self.proposal_buffer_reject_exact_design_duplicates
+        ):
+            return candidates[:batch_size]
+
+        proxy = self._design_proxy(candidates)
+        buffer_proxy = self._buffer_design_proxy()
+        selected: list[int] = []
+        selected_mask = torch.zeros(candidates.shape[0], dtype=torch.bool)
+        buffer_rejected_mask = torch.zeros(candidates.shape[0], dtype=torch.bool)
+        for idx in range(candidates.shape[0]):
+            if buffer_proxy is not None:
+                if self.proposal_buffer_reject_exact_design_duplicates and bool(
+                    (buffer_proxy == proxy[idx]).all(dim=1).any().item()
+                ):
+                    buffer_rejected_mask[idx] = True
+                    continue
+                if self.proposal_buffer_novelty_min_hamming > 0:
+                    buffer_distances = (
+                        (buffer_proxy != proxy[idx]).to(torch.float32).mean(dim=1)
+                    )
+                    if (
+                        float(buffer_distances.min().item())
+                        < self.proposal_buffer_novelty_min_hamming
+                    ):
+                        buffer_rejected_mask[idx] = True
+                        continue
+            if not selected:
+                selected.append(idx)
+                selected_mask[idx] = True
+            else:
+                if self.proposal_diversity_min_hamming <= 0:
+                    selected.append(idx)
+                    selected_mask[idx] = True
+                else:
+                    selected_proxy = proxy[selected]
+                    distances = (
+                        (selected_proxy != proxy[idx]).to(torch.float32).mean(dim=1)
+                    )
+                    if (
+                        float(distances.min().item())
+                        >= self.proposal_diversity_min_hamming
+                    ):
+                        selected.append(idx)
+                        selected_mask[idx] = True
+            if len(selected) >= batch_size:
+                break
+
+        if len(selected) < batch_size:
+            for idx in range(candidates.shape[0]):
+                if not bool(selected_mask[idx]) and not bool(buffer_rejected_mask[idx]):
+                    selected.append(idx)
+                if len(selected) >= batch_size:
+                    break
+        if not selected:
+            return candidates[:batch_size]
+        return candidates[selected[:batch_size]]
+
+    def _proposal_evolution_parent_pool(self, pool: torch.Tensor) -> torch.Tensor:
+        if (
+            self.proposal_evolution_parent_source == "pool_buffer"
+            and len(self.buffer.B) >= 2
+        ):
+            parent_pool_size = min(self.ga_parent_pool_size, len(self.buffer.B))
+            buffer_parents = self.buffer.B.get_top_k(parent_pool_size).to(
+                self.gan.device, self.gan.dtype
+            )
+            return torch.cat([pool, buffer_parents], dim=0)
+        return pool
+
+    def _proposal_evolution_crossover_children(
+        self,
+        parent_a: torch.Tensor,
+        parent_b: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.proposal_evolution_crossover == "uniform":
+            mix_mask = torch.rand_like(parent_a) < 0.5
+            return torch.where(mix_mask, parent_a, parent_b)
+
+        height = self.proposal_evolution_grid_height
+        width = self.proposal_evolution_grid_width
+        if height is None or width is None or parent_a.shape[1] != height * width:
+            mix_mask = torch.rand_like(parent_a) < 0.5
+            return torch.where(mix_mask, parent_a, parent_b)
+
+        a_grid = parent_a.reshape(parent_a.shape[0], height, width)
+        b_grid = parent_b.reshape(parent_b.shape[0], height, width)
+        children = a_grid.clone()
+        if self.proposal_evolution_crossover == "row":
+            row_mask = (
+                torch.rand(parent_a.shape[0], height, 1, device=parent_a.device) < 0.5
+            )
+            children = torch.where(row_mask, a_grid, b_grid)
+        else:
+            for idx in range(parent_a.shape[0]):
+                y0 = int(torch.randint(height, (1,), device=parent_a.device).item())
+                y1 = int(
+                    torch.randint(
+                        y0 + 1, height + 1, (1,), device=parent_a.device
+                    ).item()
+                )
+                x0 = int(torch.randint(width, (1,), device=parent_a.device).item())
+                x1 = int(
+                    torch.randint(
+                        x0 + 1, width + 1, (1,), device=parent_a.device
+                    ).item()
+                )
+                children[idx, y0:y1, x0:x1] = b_grid[idx, y0:y1, x0:x1]
+        return children.reshape(parent_a.shape)
+
+    def _augment_proposal_pool_with_evolution(self, pool: torch.Tensor) -> torch.Tensor:
+        if self.proposal_evolution_fraction <= 0 or pool.shape[0] < 2:
+            return pool
+        child_count = int(round(pool.shape[0] * self.proposal_evolution_fraction))
+        child_count = min(max(child_count, 0), pool.shape[0])
+        if child_count == 0:
+            return pool
+
+        parents = self._proposal_evolution_parent_pool(pool)
+        parent_count = parents.shape[0]
+        parent_a = parents[
+            torch.randint(parent_count, (child_count,), device=pool.device)
+        ]
+        parent_b = parents[
+            torch.randint(parent_count, (child_count,), device=pool.device)
+        ]
+        children = self._proposal_evolution_crossover_children(parent_a, parent_b)
+        if (
+            self.proposal_evolution_mutation_rate > 0
+            and self.proposal_evolution_mutation_scale > 0
+        ):
+            mutation_mask = (
+                torch.rand_like(children) < self.proposal_evolution_mutation_rate
+            )
+            noise = torch.randn_like(children) * self.proposal_evolution_mutation_scale
+            children = torch.where(mutation_mask, children + noise, children)
+        if child_count == pool.shape[0]:
+            return children
+        return torch.cat([pool[: pool.shape[0] - child_count], children], dim=0)
+
+    def _refine_proposals_with_d_gradient(
+        self, proposals: torch.Tensor
+    ) -> torch.Tensor:
+        if self.proposal_gradient_steps <= 0 or self.proposal_gradient_step_size <= 0:
+            return proposals.detach()
+        if self.proposal_gradient_mode == "swap":
+            return self._refine_proposals_with_d_gradient_swaps(proposals)
+
+        original = proposals.detach()
+        refined = original.clone()
+        for _ in range(self.proposal_gradient_steps):
+            refined = refined.detach().requires_grad_(True)
+            scores = self.gan.D(refined).reshape(-1)
+            grad = torch.autograd.grad(scores.sum(), refined, only_inputs=True)[0]
+            if self.proposal_gradient_normalize:
+                grad_scale = grad.reshape(grad.shape[0], -1).norm(dim=1).clamp_min(1e-8)
+                grad = grad / grad_scale.reshape(-1, *([1] * (grad.ndim - 1)))
+            refined = refined + self.proposal_gradient_step_size * grad
+            if self.proposal_gradient_noise > 0:
+                refined = (
+                    refined + torch.randn_like(refined) * self.proposal_gradient_noise
+                )
+
+        refined = refined.detach()
+        if self.proposal_gradient_keep_original:
+            return torch.cat([original, refined], dim=0)
+        return refined
+
+    def _refine_proposals_with_d_gradient_swaps(
+        self,
+        proposals: torch.Tensor,
+    ) -> torch.Tensor:
+        original = proposals.detach()
+        refined = original.clone()
+        flat_dim = refined.reshape(refined.shape[0], -1).shape[1]
+        material_count = int(round(self.proposal_diversity_topk_frac * flat_dim))
+        material_count = min(max(material_count, 1), flat_dim - 1)
+        swap_count = int(round(self.proposal_gradient_step_size * material_count))
+        swap_count = min(max(swap_count, 1), material_count, flat_dim - material_count)
+
+        for _ in range(self.proposal_gradient_steps):
+            refined = refined.detach().requires_grad_(True)
+            scores = self.gan.D(refined).reshape(-1)
+            grad = torch.autograd.grad(scores.sum(), refined, only_inputs=True)[0]
+            flat = refined.detach().reshape(refined.shape[0], -1)
+            grad_flat = grad.detach().reshape(grad.shape[0], -1)
+
+            top_idx = torch.topk(flat, k=material_count, dim=1).indices
+            solid_mask = torch.zeros_like(flat, dtype=torch.bool)
+            solid_mask.scatter_(1, top_idx, True)
+            void_mask = ~solid_mask
+
+            demote_scores = torch.where(solid_mask, -grad_flat, -torch.inf)
+            promote_scores = torch.where(void_mask, grad_flat, -torch.inf)
+            demote_idx = torch.topk(demote_scores, k=swap_count, dim=1).indices
+            promote_idx = torch.topk(promote_scores, k=swap_count, dim=1).indices
+
+            child = flat.clone()
+            demote_values = torch.gather(child, 1, demote_idx)
+            promote_values = torch.gather(child, 1, promote_idx)
+            margin = torch.clamp(
+                (demote_values - promote_values).abs() + 1e-3,
+                min=1e-3,
+            )
+            child.scatter_(1, promote_idx, demote_values + margin)
+            child.scatter_(1, demote_idx, promote_values - margin)
+            if self.proposal_gradient_noise > 0:
+                child = child + torch.randn_like(child) * self.proposal_gradient_noise
+            refined = child.reshape_as(refined)
+
+        refined = refined.detach()
+        if self.proposal_gradient_keep_original:
+            return torch.cat([original, refined], dim=0)
+        return refined
+
+    def _select_ranked_exploration_proposals(
+        self, proposals: torch.Tensor
+    ) -> torch.Tensor:
+        if self.proposal_pool_size is None:
+            refined = self._refine_proposals_with_d_gradient(proposals)
+            if refined.shape[0] > self.components.batch_size:
+                with torch.no_grad():
+                    scores = self.gan.D(refined).reshape(-1)
+                    order = torch.topk(
+                        scores,
+                        k=self.components.batch_size,
+                        dim=0,
+                    ).indices
+                    refined = refined[order]
+            return self._select_ga_mixed_proposals(refined)
+
+        pool_size = max(self.proposal_pool_size, self.components.batch_size)
+        with torch.no_grad():
+            z = self._sample_latents(pool_size)
+            pool = self._generate(z)
+            pool = self._augment_proposal_pool_with_evolution(pool)
+        pool = self._refine_proposals_with_d_gradient(pool)
+        with torch.no_grad():
+            scores = self.gan.D(pool).reshape(-1)
+            top_k = self.proposal_top_k or pool_size
+            top_k = min(max(top_k, self.components.batch_size), pool.shape[0])
+            order = torch.topk(scores, k=top_k, dim=0).indices
+            ranked_pool = pool[order]
+            selected = self._select_diverse_ranked_candidates(ranked_pool)
+        return self._select_ga_mixed_proposals(selected)
+
+    def _make_ga_children(self, count: int) -> torch.Tensor:
+        parent_pool_size = min(self.ga_parent_pool_size, len(self.buffer.B))
+        parents = self.buffer.B.get_top_k(parent_pool_size).to(
+            self.gan.device, self.gan.dtype
+        )
+        parent_a = parents[
+            torch.randint(parent_pool_size, (count,), device=self.gan.device)
+        ]
+        parent_b = parents[
+            torch.randint(parent_pool_size, (count,), device=self.gan.device)
+        ]
+        mix_mask = torch.rand_like(parent_a) < 0.5
+        children = torch.where(mix_mask, parent_a, parent_b)
+        if self.ga_mutation_rate > 0 and self.ga_mutation_scale > 0:
+            mutation_mask = torch.rand_like(children) < self.ga_mutation_rate
+            noise = torch.randn_like(children) * self.ga_mutation_scale
+            children = torch.where(mutation_mask, children + noise, children)
+        return children
+
+    def _select_ga_children(self, count: int) -> torch.Tensor:
+        pool_size = self.ga_pool_size or max(count * 4, self.components.batch_size)
+        pool_size = max(pool_size, count)
+        children = self._make_ga_children(pool_size)
+        scores = self.gan.D(children).reshape(-1)
+        order = torch.topk(scores, k=count, dim=0).indices
+        return children[order]
+
+    def _select_ga_mixed_proposals(self, proposals: torch.Tensor) -> torch.Tensor:
+        if self.ga_offspring_fraction <= 0 or len(self.buffer.B) < 2:
+            return proposals
+        batch_size = proposals.shape[0]
+        ga_count = int(round(batch_size * self.ga_offspring_fraction))
+        ga_count = min(max(ga_count, 0), batch_size)
+        if ga_count == 0:
+            return proposals
+        with torch.no_grad():
+            ga_children = self._select_ga_children(ga_count)
+        if ga_count == batch_size:
+            return ga_children
+        return torch.cat(
+            [proposals[: batch_size - ga_count].detach(), ga_children], dim=0
+        )
+
+    def _reject_exact_buffer_design_duplicates(
+        self,
+        proposals: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            not self.proposal_buffer_reject_exact_design_duplicates
+            or self.design_proxy is None
+            or len(self.buffer.B) == 0
+            or proposals.shape[0] == 0
+        ):
+            return proposals, None
+
+        buffer_proxy = self._buffer_design_proxy()
+        if buffer_proxy is None:
+            return proposals, None
+
+        proposal_proxy = self._design_proxy(proposals)
+        keep: list[int] = []
+        for idx in range(proposal_proxy.shape[0]):
+            candidate = proposal_proxy[idx]
+            in_buffer = bool((buffer_proxy == candidate).all(dim=1).any().item())
+            if in_buffer:
+                continue
+            if keep:
+                kept_proxy = proposal_proxy[keep]
+                in_batch = bool((kept_proxy == candidate).all(dim=1).any().item())
+                if in_batch:
+                    continue
+            keep.append(idx)
+
+        if len(keep) == proposals.shape[0]:
+            return proposals, None
+        if not keep:
+            return proposals[:0], torch.empty(0, dtype=torch.long)
+        keep_idx = torch.as_tensor(keep, dtype=torch.long, device=proposals.device)
+        return proposals.index_select(0, keep_idx), keep_idx.detach().cpu()
+
     def _train_ranker_step(self) -> None:
         if len(self.buffer.B) < 2:
             return
@@ -1359,7 +3399,7 @@ class BufferPlackettLuceRankerOpt(BaseOpt):
 
         self.gan.optimizerG.zero_grad()
         z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-        proposals = self.gan.G(z)
+        proposals = self._generate(z, track_genomes=True)
         scores = self.gan.D(proposals).reshape(-1)
         if self.generator_elite_margin:
             elite = self._ranked_buffer_subset(
@@ -1377,8 +3417,401 @@ class BufferPlackettLuceRankerOpt(BaseOpt):
         return proposals
 
     def evaluate(self, proposals: torch.Tensor) -> None:
+        proposals, keep_idx = self._reject_exact_buffer_design_duplicates(
+            proposals.detach()
+        )
+        if (
+            keep_idx is not None
+            and self._pending_genomes is not None
+            and self._pending_genomes.shape[0] >= int(keep_idx.numel())
+        ):
+            self._pending_genomes = self._pending_genomes.index_select(
+                0,
+                keep_idx.to(self._pending_genomes.device),
+            )
+        if proposals.shape[0] == 0:
+            self._pending_genomes = None
+            return
         values = self.fn.f(proposals.detach().to(self.fn.device, self.fn.dtype))
-        self.buffer.B.insert_many(values=list(values), tensors=list(proposals.detach()))
+        value_list = [list(v) for v in values]
+        self.buffer.B.insert_many(values=value_list, tensors=list(proposals.detach()))
+        if (
+            self._pending_genomes is not None
+            and self._pending_genomes.shape[0] == proposals.shape[0]
+        ):
+            self.genome_archive.add_many(self._pending_genomes, value_list)
+        self._pending_genomes = None
+
+
+class ContextualPlackettLuceRankerOpt(BufferPlackettLuceRankerOpt):
+    """PL ranker whose generator is trained against an evaluated context list."""
+
+    def __init__(
+        self,
+        components: components.OptComponents,
+        *,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        ranker_sample_pool_size: int | None = None,
+        ranker_sample_mode: str = "random_top_pool",
+        d_score_center_weight: float = 0.0,
+        d_score_scale_weight: float = 0.0,
+        d_score_target_std: float = 1.0,
+        **kwargs: Any,
+    ) -> None:
+        if d_score_center_weight < 0:
+            raise ValueError(
+                "d_score_center_weight must be non-negative, "
+                f"got {d_score_center_weight}"
+            )
+        if d_score_scale_weight < 0:
+            raise ValueError(
+                "d_score_scale_weight must be non-negative, "
+                f"got {d_score_scale_weight}"
+            )
+        if d_score_target_std <= 0:
+            raise ValueError(
+                f"d_score_target_std must be positive, got {d_score_target_std}"
+            )
+        self.d_score_center_weight = d_score_center_weight
+        self.d_score_scale_weight = d_score_scale_weight
+        self.d_score_target_std = d_score_target_std
+        self._last_evaluated_tensors: torch.Tensor | None = None
+        self._last_evaluated_values: list[list[float]] = []
+        super().__init__(
+            components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+            **kwargs,
+        )
+
+    def _sample_ranked_mixed_evaluated_list(self, k: int) -> torch.Tensor:
+        if self._last_evaluated_tensors is None or not self._last_evaluated_values:
+            return self._ranked_buffer_subset(k)
+
+        buffer_values = self.buffer.B.get_sorted_values()
+        pool_size = len(buffer_values)
+        if self.ranker_sample_pool_size is not None:
+            pool_size = min(pool_size, max(k, self.ranker_sample_pool_size))
+        buffer_k = min(k, pool_size)
+        if buffer_k == pool_size:
+            buffer_positions = list(range(buffer_k))
+        else:
+            buffer_positions = (
+                torch.randperm(pool_size)[:buffer_k].sort().values.tolist()
+            )
+
+        items: list[tuple[list[float], torch.Tensor]] = [
+            (
+                [float(v) for v in buffer_values[int(pos)]],
+                self.buffer.B.get(int(pos)).detach(),
+            )
+            for pos in buffer_positions
+        ]
+        items.extend(
+            (
+                value,
+                tensor.detach().cpu(),
+            )
+            for value, tensor in zip(
+                self._last_evaluated_values,
+                self._last_evaluated_tensors.detach().cpu(),
+                strict=True,
+            )
+        )
+        items.sort(key=lambda item: tuple(item[0]))
+        if len(items) > k:
+            selected = torch.randperm(len(items))[:k].sort().values.tolist()
+            items = [items[int(idx)] for idx in selected]
+        return torch.stack([tensor for _value, tensor in items]).to(
+            self.gan.device,
+            self.gan.dtype,
+        )
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+        ranked = self._sample_ranked_mixed_evaluated_list(self.ranker_list_size)
+        scores = self.gan.D(ranked).reshape(-1)
+        loss = plackett_luce_loss(scores)
+        if self.d_score_center_weight > 0:
+            loss = loss + self.d_score_center_weight * scores.mean().square()
+        if self.d_score_scale_weight > 0 and scores.numel() > 1:
+            std = scores.std(unbiased=False)
+            loss = (
+                loss
+                + self.d_score_scale_weight * (std - self.d_score_target_std).square()
+            )
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self._generate(z, track_genomes=True)
+        proposal_scores = self.gan.D(proposals).reshape(-1)
+        context = self._ranked_buffer_subset(
+            min(self.ranker_list_size, len(self.buffer.B))
+        )
+        with torch.no_grad():
+            context_scores = self.gan.D(context).reshape(-1)
+        loss = contextual_plackett_luce_generator_loss(
+            proposal_scores,
+            context_scores,
+        )
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return self._select_ranked_exploration_proposals(proposals)
+
+    def evaluate(self, proposals: torch.Tensor) -> None:
+        proposals, keep_idx = self._reject_exact_buffer_design_duplicates(
+            proposals.detach()
+        )
+        if (
+            keep_idx is not None
+            and self._pending_genomes is not None
+            and self._pending_genomes.shape[0] >= int(keep_idx.numel())
+        ):
+            self._pending_genomes = self._pending_genomes.index_select(
+                0,
+                keep_idx.to(self._pending_genomes.device),
+            )
+        if proposals.shape[0] == 0:
+            self._last_evaluated_tensors = None
+            self._last_evaluated_values = []
+            self._pending_genomes = None
+            return
+        values = self.fn.f(proposals.detach().to(self.fn.device, self.fn.dtype))
+        value_list = [list(v) for v in values]
+        detached = proposals.detach()
+        self.buffer.B.insert_many(values=value_list, tensors=list(detached))
+        self._last_evaluated_tensors = detached.cpu()
+        self._last_evaluated_values = value_list
+        if (
+            self._pending_genomes is not None
+            and self._pending_genomes.shape[0] == proposals.shape[0]
+        ):
+            self.genome_archive.add_many(self._pending_genomes, value_list)
+        self._pending_genomes = None
+
+
+class CalibratedUtilityRankerOpt(ContextualPlackettLuceRankerOpt):
+    """Reward model that predicts calibrated utility from true evaluated values."""
+
+    def __init__(
+        self,
+        components: components.OptComponents,
+        *,
+        utility_target_scale: float = 100.0,
+        utility_loss: str = "smooth_l1",
+        **kwargs: Any,
+    ) -> None:
+        if utility_target_scale <= 0:
+            raise ValueError(
+                f"utility_target_scale must be positive, got {utility_target_scale}"
+            )
+        if utility_loss not in {"smooth_l1", "mse"}:
+            raise ValueError(
+                "utility_loss must be one of smooth_l1, mse; " f"got {utility_loss}"
+            )
+        self.utility_target_scale = utility_target_scale
+        self.utility_loss = utility_loss
+        super().__init__(components, **kwargs)
+
+    def _sample_mixed_evaluated_items(
+        self,
+        k: int,
+    ) -> tuple[torch.Tensor, list[list[float]]]:
+        buffer_values = self.buffer.B.get_sorted_values()
+        pool_size = len(buffer_values)
+        if self.ranker_sample_pool_size is not None:
+            pool_size = min(pool_size, max(k, self.ranker_sample_pool_size))
+        buffer_k = min(k, pool_size)
+        if buffer_k == pool_size:
+            buffer_positions = list(range(buffer_k))
+        else:
+            buffer_positions = (
+                torch.randperm(pool_size)[:buffer_k].sort().values.tolist()
+            )
+
+        items: list[tuple[list[float], torch.Tensor]] = [
+            (
+                [float(v) for v in buffer_values[int(pos)]],
+                self.buffer.B.get(int(pos)).detach(),
+            )
+            for pos in buffer_positions
+        ]
+        if self._last_evaluated_tensors is not None and self._last_evaluated_values:
+            items.extend(
+                (
+                    value,
+                    tensor.detach().cpu(),
+                )
+                for value, tensor in zip(
+                    self._last_evaluated_values,
+                    self._last_evaluated_tensors.detach().cpu(),
+                    strict=True,
+                )
+            )
+        items.sort(key=lambda item: tuple(item[0]))
+        if len(items) > k:
+            selected = torch.randperm(len(items))[:k].sort().values.tolist()
+            items = [items[int(idx)] for idx in selected]
+        tensors = torch.stack([tensor for _value, tensor in items]).to(
+            self.gan.device,
+            self.gan.dtype,
+        )
+        values = [value for value, _tensor in items]
+        return tensors, values
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+        tensors, values = self._sample_mixed_evaluated_items(self.ranker_list_size)
+        scores = self.gan.D(tensors).reshape(-1)
+        targets = utility_targets_from_values(
+            values,
+            scale=self.utility_target_scale,
+            device=scores.device,
+            dtype=scores.dtype,
+        )
+        if self.utility_loss == "mse":
+            loss = F.mse_loss(scores, targets)
+        else:
+            loss = F.smooth_l1_loss(scores, targets)
+        if self.d_score_center_weight > 0:
+            loss = (
+                loss + self.d_score_center_weight * (scores - targets).mean().square()
+            )
+        if self.d_score_scale_weight > 0 and scores.numel() > 1:
+            residual_std = (scores - targets).std(unbiased=False)
+            loss = loss + self.d_score_scale_weight * residual_std.square()
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self._generate(z, track_genomes=True)
+        scores = self.gan.D(proposals).reshape(-1)
+        loss = -scores.mean()
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return self._select_ranked_exploration_proposals(proposals)
+
+
+class HybridContextualUtilityRankerOpt(CalibratedUtilityRankerOpt):
+    """Contextual PL ranker with light local utility calibration."""
+
+    def __init__(
+        self,
+        components: components.OptComponents,
+        *,
+        utility_weight: float = 0.1,
+        generator_utility_weight: float = 0.0,
+        utility_clip: float = 3.0,
+        **kwargs: Any,
+    ) -> None:
+        if utility_weight < 0:
+            raise ValueError(
+                f"utility_weight must be non-negative, got {utility_weight}"
+            )
+        if generator_utility_weight < 0:
+            raise ValueError(
+                "generator_utility_weight must be non-negative, "
+                f"got {generator_utility_weight}"
+            )
+        if utility_clip <= 0:
+            raise ValueError(f"utility_clip must be positive, got {utility_clip}")
+        self.utility_weight = utility_weight
+        self.generator_utility_weight = generator_utility_weight
+        self.utility_clip = utility_clip
+        super().__init__(components, **kwargs)
+
+    def _local_utility_targets(
+        self,
+        values: list[list[float]],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        values_array = np.asarray(values, dtype=np.float32)
+        if values_array.ndim == 1:
+            values_array = values_array[:, None]
+        objective = values_array[:, -1]
+        reference = float(np.mean(objective))
+        scale = float(np.std(objective))
+        if scale < 1e-6:
+            scale = self.utility_target_scale
+        utilities = (reference - objective) / max(scale, 1e-6)
+        utilities = np.clip(utilities, -self.utility_clip, self.utility_clip)
+        return torch.as_tensor(utilities, device=device, dtype=dtype)
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+        tensors, values = self._sample_mixed_evaluated_items(self.ranker_list_size)
+        scores = self.gan.D(tensors).reshape(-1)
+        pl_loss = plackett_luce_loss(scores)
+        targets = self._local_utility_targets(
+            values,
+            device=scores.device,
+            dtype=scores.dtype,
+        )
+        if self.utility_loss == "mse":
+            utility_loss = F.mse_loss(scores, targets)
+        else:
+            utility_loss = F.smooth_l1_loss(scores, targets)
+        loss = pl_loss + self.utility_weight * utility_loss
+        if self.d_score_center_weight > 0:
+            loss = loss + self.d_score_center_weight * scores.mean().square()
+        if self.d_score_scale_weight > 0 and scores.numel() > 1:
+            std = scores.std(unbiased=False)
+            loss = (
+                loss
+                + self.d_score_scale_weight * (std - self.d_score_target_std).square()
+            )
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self._generate(z, track_genomes=True)
+        proposal_scores = self.gan.D(proposals).reshape(-1)
+        context = self._ranked_buffer_subset(
+            min(self.ranker_list_size, len(self.buffer.B))
+        )
+        with torch.no_grad():
+            context_scores = self.gan.D(context).reshape(-1)
+        loss = contextual_plackett_luce_generator_loss(
+            proposal_scores,
+            context_scores,
+        )
+        loss = loss - self.generator_utility_weight * proposal_scores.mean()
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return self._select_ranked_exploration_proposals(proposals)
 
 
 class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
@@ -1393,6 +3826,34 @@ class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
         ranker_weight: float = 0.1,
         ranker_sample_pool_size: int | None = None,
         ranker_sample_mode: str = "random_top_pool",
+        proposal_pool_size: int | None = None,
+        proposal_top_k: int | None = None,
+        proposal_diversity_min_hamming: float = 0.0,
+        proposal_diversity_topk_frac: float = 0.48,
+        proposal_buffer_novelty_min_hamming: float = 0.0,
+        proposal_buffer_novelty_reference_size: int = 128,
+        proposal_buffer_reject_exact_design_duplicates: bool = False,
+        design_proxy: DesignProxyFn | None = None,
+        proposal_evolution_fraction: float = 0.0,
+        proposal_evolution_parent_source: str = "pool",
+        proposal_evolution_crossover: str = "uniform",
+        proposal_evolution_mutation_rate: float = 0.01,
+        proposal_evolution_mutation_scale: float = 0.10,
+        proposal_evolution_grid_height: int | None = None,
+        proposal_evolution_grid_width: int | None = None,
+        proposal_gradient_steps: int = 0,
+        proposal_gradient_step_size: float = 0.05,
+        proposal_gradient_mode: str = "continuous",
+        proposal_gradient_normalize: bool = True,
+        proposal_gradient_noise: float = 0.0,
+        proposal_gradient_keep_original: bool = False,
+        ga_offspring_fraction: float = 0.0,
+        ga_pool_size: int | None = None,
+        ga_parent_pool_size: int = 128,
+        ga_mutation_rate: float = 0.02,
+        ga_mutation_scale: float = 0.25,
+        generator_elite_context_size: int = 0,
+        generator_elite_context_pool_size: int | None = None,
     ) -> None:
         super().__init__(
             opt_components,
@@ -1401,6 +3862,34 @@ class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
             generator_elite_margin=False,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
         if ranker_weight < 0:
             raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
@@ -1417,7 +3906,7 @@ class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
 
         with torch.no_grad():
             z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-            fake = self.gan.G(z)
+            fake = self._generate(z)
         fake_scores = self.gan.D(fake.detach())
         fake_loss = 0.5 * (fake_scores**2).mean()
 
@@ -1431,14 +3920,14 @@ class RankedLSGANOpt(BufferPlackettLuceRankerOpt):
 
         self.gan.optimizerG.zero_grad()
         z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-        proposals = self.gan.G(z)
+        proposals = self._generate(z, track_genomes=True)
         scores = self.gan.D(proposals)
         loss = 0.5 * ((scores - 1.0) ** 2).mean()
         if self.gan.curiosity_loss is not None:
             loss = loss + self.gan.curiosity_loss(proposals)
         loss.backward()
         self.gan.optimizerG.step()
-        return proposals
+        return self._select_ranked_exploration_proposals(proposals)
 
 
 class RankedDefaultOpt(BufferPlackettLuceRankerOpt):
@@ -1453,6 +3942,34 @@ class RankedDefaultOpt(BufferPlackettLuceRankerOpt):
         ranker_weight: float = 0.1,
         ranker_sample_pool_size: int | None = None,
         ranker_sample_mode: str = "random_top_pool",
+        proposal_pool_size: int | None = None,
+        proposal_top_k: int | None = None,
+        proposal_diversity_min_hamming: float = 0.0,
+        proposal_diversity_topk_frac: float = 0.48,
+        proposal_buffer_novelty_min_hamming: float = 0.0,
+        proposal_buffer_novelty_reference_size: int = 128,
+        proposal_buffer_reject_exact_design_duplicates: bool = False,
+        design_proxy: DesignProxyFn | None = None,
+        proposal_evolution_fraction: float = 0.0,
+        proposal_evolution_parent_source: str = "pool",
+        proposal_evolution_crossover: str = "uniform",
+        proposal_evolution_mutation_rate: float = 0.01,
+        proposal_evolution_mutation_scale: float = 0.10,
+        proposal_evolution_grid_height: int | None = None,
+        proposal_evolution_grid_width: int | None = None,
+        proposal_gradient_steps: int = 0,
+        proposal_gradient_step_size: float = 0.05,
+        proposal_gradient_mode: str = "continuous",
+        proposal_gradient_normalize: bool = True,
+        proposal_gradient_noise: float = 0.0,
+        proposal_gradient_keep_original: bool = False,
+        ga_offspring_fraction: float = 0.0,
+        ga_pool_size: int | None = None,
+        ga_parent_pool_size: int = 128,
+        ga_mutation_rate: float = 0.02,
+        ga_mutation_scale: float = 0.25,
+        generator_elite_context_size: int = 0,
+        generator_elite_context_pool_size: int | None = None,
     ) -> None:
         super().__init__(
             opt_components,
@@ -1461,6 +3978,34 @@ class RankedDefaultOpt(BufferPlackettLuceRankerOpt):
             generator_elite_margin=False,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
         if ranker_weight < 0:
             raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
@@ -1477,7 +4022,7 @@ class RankedDefaultOpt(BufferPlackettLuceRankerOpt):
 
         with torch.no_grad():
             z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-            fake = self.gan.G(z)
+            fake = self._generate(z)
         fake_scores = self.gan.D(fake.detach())
         fake_loss = self.gan.loss(fake_scores, torch.zeros_like(fake_scores))
 
@@ -1491,14 +4036,14 @@ class RankedDefaultOpt(BufferPlackettLuceRankerOpt):
 
         self.gan.optimizerG.zero_grad()
         z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-        proposals = self.gan.G(z)
+        proposals = self._generate(z, track_genomes=True)
         scores = self.gan.D(proposals)
         loss = self.gan.loss(scores, torch.ones_like(scores))
         if self.gan.curiosity_loss is not None:
             loss = loss + self.gan.curiosity_loss(proposals)
         loss.backward()
         self.gan.optimizerG.step()
-        return proposals
+        return self._select_ranked_exploration_proposals(proposals)
 
 
 class RankedWGANOpt(BufferPlackettLuceRankerOpt):
@@ -1513,6 +4058,34 @@ class RankedWGANOpt(BufferPlackettLuceRankerOpt):
         ranker_weight: float = 0.1,
         ranker_sample_pool_size: int | None = None,
         ranker_sample_mode: str = "random_top_pool",
+        proposal_pool_size: int | None = None,
+        proposal_top_k: int | None = None,
+        proposal_diversity_min_hamming: float = 0.0,
+        proposal_diversity_topk_frac: float = 0.48,
+        proposal_buffer_novelty_min_hamming: float = 0.0,
+        proposal_buffer_novelty_reference_size: int = 128,
+        proposal_buffer_reject_exact_design_duplicates: bool = False,
+        design_proxy: DesignProxyFn | None = None,
+        proposal_evolution_fraction: float = 0.0,
+        proposal_evolution_parent_source: str = "pool",
+        proposal_evolution_crossover: str = "uniform",
+        proposal_evolution_mutation_rate: float = 0.01,
+        proposal_evolution_mutation_scale: float = 0.10,
+        proposal_evolution_grid_height: int | None = None,
+        proposal_evolution_grid_width: int | None = None,
+        proposal_gradient_steps: int = 0,
+        proposal_gradient_step_size: float = 0.05,
+        proposal_gradient_mode: str = "continuous",
+        proposal_gradient_normalize: bool = True,
+        proposal_gradient_noise: float = 0.0,
+        proposal_gradient_keep_original: bool = False,
+        ga_offspring_fraction: float = 0.0,
+        ga_pool_size: int | None = None,
+        ga_parent_pool_size: int = 128,
+        ga_mutation_rate: float = 0.02,
+        ga_mutation_scale: float = 0.25,
+        generator_elite_context_size: int = 0,
+        generator_elite_context_pool_size: int | None = None,
     ) -> None:
         super().__init__(
             opt_components,
@@ -1521,6 +4094,34 @@ class RankedWGANOpt(BufferPlackettLuceRankerOpt):
             generator_elite_margin=False,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
         if ranker_weight < 0:
             raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
@@ -1546,7 +4147,7 @@ class RankedWGANOpt(BufferPlackettLuceRankerOpt):
 
         with torch.no_grad():
             z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-            fake = self.gan.G(z)
+            fake = self._generate(z)
         fake_scores = self.gan.D(fake.detach()).reshape(-1)
 
         loss = fake_scores.mean() + self.ranker_weight * rank_loss
@@ -1560,13 +4161,13 @@ class RankedWGANOpt(BufferPlackettLuceRankerOpt):
 
         self.gan.optimizerG.zero_grad()
         z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-        proposals = self.gan.G(z)
+        proposals = self._generate(z, track_genomes=True)
         loss = -self.gan.D(proposals).reshape(-1).mean()
         if self.gan.curiosity_loss is not None:
             loss = loss + self.gan.curiosity_loss(proposals)
         loss.backward()
         self.gan.optimizerG.step()
-        return proposals
+        return self._select_ranked_exploration_proposals(proposals)
 
 
 class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
@@ -1584,6 +4185,37 @@ class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
         ranker_sample_pool_size: int | None = None,
         ranker_sample_mode: str = "random_top_pool",
         ranker_target_scope: str = "local",
+        ranker_list_repeats: int = 1,
+        ranker_fake_weight: float = 1.0,
+        ranker_fake_repeats: int = 1,
+        proposal_pool_size: int | None = None,
+        proposal_top_k: int | None = None,
+        proposal_diversity_min_hamming: float = 0.0,
+        proposal_diversity_topk_frac: float = 0.48,
+        proposal_buffer_novelty_min_hamming: float = 0.0,
+        proposal_buffer_novelty_reference_size: int = 128,
+        proposal_buffer_reject_exact_design_duplicates: bool = False,
+        design_proxy: DesignProxyFn | None = None,
+        proposal_evolution_fraction: float = 0.0,
+        proposal_evolution_parent_source: str = "pool",
+        proposal_evolution_crossover: str = "uniform",
+        proposal_evolution_mutation_rate: float = 0.01,
+        proposal_evolution_mutation_scale: float = 0.10,
+        proposal_evolution_grid_height: int | None = None,
+        proposal_evolution_grid_width: int | None = None,
+        proposal_gradient_steps: int = 0,
+        proposal_gradient_step_size: float = 0.05,
+        proposal_gradient_mode: str = "continuous",
+        proposal_gradient_normalize: bool = True,
+        proposal_gradient_noise: float = 0.0,
+        proposal_gradient_keep_original: bool = False,
+        ga_offspring_fraction: float = 0.0,
+        ga_pool_size: int | None = None,
+        ga_parent_pool_size: int = 128,
+        ga_mutation_rate: float = 0.02,
+        ga_mutation_scale: float = 0.25,
+        generator_elite_context_size: int = 0,
+        generator_elite_context_pool_size: int | None = None,
     ) -> None:
         super().__init__(
             opt_components,
@@ -1592,12 +4224,55 @@ class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
             generator_elite_margin=False,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
         if ranker_weight < 0:
             raise ValueError(f"ranker_weight must be non-negative, got {ranker_weight}")
         self.ranker_weight = ranker_weight
         self.ranker_target_curve = ranker_target_curve
         self.ranker_tau = ranker_tau
+        if ranker_list_repeats < 1:
+            raise ValueError(
+                f"ranker_list_repeats must be >= 1, got {ranker_list_repeats}"
+            )
+        if ranker_fake_weight < 0:
+            raise ValueError(
+                f"ranker_fake_weight must be non-negative, got {ranker_fake_weight}"
+            )
+        if ranker_fake_repeats < 1:
+            raise ValueError(
+                f"ranker_fake_repeats must be >= 1, got {ranker_fake_repeats}"
+            )
+        self.ranker_list_repeats = ranker_list_repeats
+        self.ranker_fake_weight = ranker_fake_weight
+        self.ranker_fake_repeats = ranker_fake_repeats
         if ranker_target_scope not in {"local", "global"}:
             raise ValueError(
                 "ranker_target_scope must be one of local, global; "
@@ -1610,35 +4285,45 @@ class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
             return
         self.gan.optimizerD.zero_grad()
 
-        ranked, positions = self._ranked_buffer_subset_with_positions(
-            self.ranker_list_size
-        )
-        real_scores = self.gan.D(ranked)
-        if self.ranker_target_scope == "global":
-            real_targets = rank_targets(
-                len(self.buffer.B),
-                device=real_scores.device,
-                dtype=real_scores.dtype,
-                curve=self.ranker_target_curve,
-                tau=self.ranker_tau,
-            )[positions.long()].reshape_as(real_scores)
-        else:
-            real_targets = rank_targets(
-                real_scores.numel(),
-                device=real_scores.device,
-                dtype=real_scores.dtype,
-                curve=self.ranker_target_curve,
-                tau=self.ranker_tau,
-            ).reshape_as(real_scores)
-        real_loss = self.gan.loss(real_scores, real_targets)
+        real_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+        for _ in range(self.ranker_list_repeats):
+            ranked, positions = self._ranked_buffer_subset_with_positions(
+                self.ranker_list_size
+            )
+            real_scores = self.gan.D(ranked)
+            if self.ranker_target_scope == "global":
+                real_targets = rank_targets(
+                    len(self.buffer.B),
+                    device=real_scores.device,
+                    dtype=real_scores.dtype,
+                    curve=self.ranker_target_curve,
+                    tau=self.ranker_tau,
+                )[positions.long()].reshape_as(real_scores)
+            else:
+                real_targets = rank_targets(
+                    real_scores.numel(),
+                    device=real_scores.device,
+                    dtype=real_scores.dtype,
+                    curve=self.ranker_target_curve,
+                    tau=self.ranker_tau,
+                ).reshape_as(real_scores)
+            real_loss = real_loss + self.gan.loss(real_scores, real_targets)
+        real_loss = real_loss / self.ranker_list_repeats
 
-        with torch.no_grad():
-            z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-            fake = self.gan.G(z)
-        fake_scores = self.gan.D(fake.detach())
-        fake_loss = self.gan.loss(fake_scores, torch.zeros_like(fake_scores))
+        fake_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+        if self.ranker_fake_weight > 0:
+            for _ in range(self.ranker_fake_repeats):
+                with torch.no_grad():
+                    z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+                    fake = self._generate(z)
+                fake_scores = self.gan.D(fake.detach())
+                fake_loss = fake_loss + self.gan.loss(
+                    fake_scores,
+                    torch.zeros_like(fake_scores),
+                )
+            fake_loss = fake_loss / self.ranker_fake_repeats
 
-        loss = fake_loss + self.ranker_weight * real_loss
+        loss = self.ranker_fake_weight * fake_loss + self.ranker_weight * real_loss
         loss.backward()
         self.gan.optimizerD.step()
 
@@ -1648,14 +4333,236 @@ class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
 
         self.gan.optimizerG.zero_grad()
         z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
-        proposals = self.gan.G(z)
+        proposals = self._generate(z, track_genomes=True)
         scores = self.gan.D(proposals)
         loss = self.gan.loss(scores, torch.ones_like(scores))
         if self.gan.curiosity_loss is not None:
             loss = loss + self.gan.curiosity_loss(proposals)
         loss.backward()
         self.gan.optimizerG.step()
-        return proposals
+        return self._select_ranked_exploration_proposals(proposals)
+
+
+class QuantileRankedValueDefaultOpt(QuantileRankedDefaultOpt):
+    """Quantile ranker with an auxiliary log-compliance value head."""
+
+    def __init__(
+        self,
+        opt_components: components.OptComponents,
+        *,
+        ranker_list_size: int = 32,
+        ranker_steps: int = 1,
+        ranker_weight: float = 1.0,
+        ranker_target_curve: str = "linear",
+        ranker_tau: float = 16.0,
+        ranker_sample_pool_size: int | None = None,
+        ranker_sample_mode: str = "random_top_pool",
+        ranker_target_scope: str = "local",
+        ranker_list_repeats: int = 1,
+        ranker_fake_weight: float = 1.0,
+        ranker_fake_repeats: int = 1,
+        utility_target_scale: float = 100.0,
+        utility_loss: str = "smooth_l1",
+        utility_weight: float = 0.1,
+        generator_utility_weight: float = 0.0,
+        utility_clip: float = 3.0,
+        proposal_pool_size: int | None = None,
+        proposal_top_k: int | None = None,
+        proposal_diversity_min_hamming: float = 0.0,
+        proposal_diversity_topk_frac: float = 0.48,
+        proposal_buffer_novelty_min_hamming: float = 0.0,
+        proposal_buffer_novelty_reference_size: int = 128,
+        proposal_buffer_reject_exact_design_duplicates: bool = False,
+        design_proxy: DesignProxyFn | None = None,
+        proposal_evolution_fraction: float = 0.0,
+        proposal_evolution_parent_source: str = "pool",
+        proposal_evolution_crossover: str = "uniform",
+        proposal_evolution_mutation_rate: float = 0.01,
+        proposal_evolution_mutation_scale: float = 0.10,
+        proposal_evolution_grid_height: int | None = None,
+        proposal_evolution_grid_width: int | None = None,
+        proposal_gradient_steps: int = 0,
+        proposal_gradient_step_size: float = 0.05,
+        proposal_gradient_mode: str = "continuous",
+        proposal_gradient_normalize: bool = True,
+        proposal_gradient_noise: float = 0.0,
+        proposal_gradient_keep_original: bool = False,
+        ga_offspring_fraction: float = 0.0,
+        ga_pool_size: int | None = None,
+        ga_parent_pool_size: int = 128,
+        ga_mutation_rate: float = 0.02,
+        ga_mutation_scale: float = 0.25,
+        generator_elite_context_size: int = 0,
+        generator_elite_context_pool_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            ranker_weight=ranker_weight,
+            ranker_target_curve=ranker_target_curve,
+            ranker_tau=ranker_tau,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+            ranker_target_scope=ranker_target_scope,
+            ranker_list_repeats=ranker_list_repeats,
+            ranker_fake_weight=ranker_fake_weight,
+            ranker_fake_repeats=ranker_fake_repeats,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
+        )
+        if utility_target_scale <= 0:
+            raise ValueError(
+                f"utility_target_scale must be positive, got {utility_target_scale}"
+            )
+        if utility_loss not in {"smooth_l1", "mse"}:
+            raise ValueError(
+                f"utility_loss must be one of smooth_l1, mse; got {utility_loss}"
+            )
+        if utility_weight < 0:
+            raise ValueError(
+                f"utility_weight must be non-negative, got {utility_weight}"
+            )
+        if generator_utility_weight != 0:
+            raise ValueError(
+                "quantile_ranked_value_default uses utility only as a D-side "
+                f"auxiliary loss; generator_utility_weight must be 0, got {generator_utility_weight}"
+            )
+        if utility_clip < 0:
+            raise ValueError(f"utility_clip must be non-negative, got {utility_clip}")
+        self.utility_target_scale = utility_target_scale
+        self.utility_loss = utility_loss
+        self.utility_weight = utility_weight
+        self.generator_utility_weight = 0.0
+        self.utility_clip = utility_clip
+
+    def _compliance_targets_for_positions(
+        self, positions: torch.Tensor
+    ) -> torch.Tensor:
+        compliance = torch.as_tensor(
+            [
+                self.buffer.B.get_value(int(position), level=-1)
+                for position in positions.detach().cpu().tolist()
+            ],
+            device=self.gan.device,
+            dtype=self.gan.dtype,
+        )
+        return log_compliance_utility_targets(
+            compliance,
+            reference=self.utility_target_scale,
+            clip=self.utility_clip,
+        )
+
+    def _value_loss(
+        self,
+        value_scores: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        value_scores = value_scores.reshape_as(targets)
+        if self.utility_loss == "mse":
+            return F.mse_loss(value_scores, targets)
+        return F.smooth_l1_loss(value_scores, targets)
+
+    def _train_ranker_step(self) -> None:
+        if len(self.buffer.B) < 2:
+            return
+        self.gan.optimizerD.zero_grad()
+
+        rank_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+        value_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+        for _ in range(self.ranker_list_repeats):
+            ranked, positions = self._ranked_buffer_subset_with_positions(
+                self.ranker_list_size
+            )
+            rank_scores, value_scores = split_rank_value_scores(self.gan.D(ranked))
+            if self.ranker_target_scope == "global":
+                real_targets = rank_targets(
+                    len(self.buffer.B),
+                    device=rank_scores.device,
+                    dtype=rank_scores.dtype,
+                    curve=self.ranker_target_curve,
+                    tau=self.ranker_tau,
+                )[positions.long()].reshape_as(rank_scores)
+            else:
+                real_targets = rank_targets(
+                    rank_scores.numel(),
+                    device=rank_scores.device,
+                    dtype=rank_scores.dtype,
+                    curve=self.ranker_target_curve,
+                    tau=self.ranker_tau,
+                ).reshape_as(rank_scores)
+            rank_loss = rank_loss + self.gan.loss(rank_scores, real_targets)
+            value_targets = self._compliance_targets_for_positions(positions)
+            value_loss = value_loss + self._value_loss(
+                value_scores.reshape(-1),
+                value_targets,
+            )
+        rank_loss = rank_loss / self.ranker_list_repeats
+        value_loss = value_loss / self.ranker_list_repeats
+
+        fake_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+        if self.ranker_fake_weight > 0:
+            for _ in range(self.ranker_fake_repeats):
+                with torch.no_grad():
+                    z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+                    fake = self._generate(z)
+                fake_rank_scores, _fake_value_scores = split_rank_value_scores(
+                    self.gan.D(fake.detach())
+                )
+                fake_loss = fake_loss + self.gan.loss(
+                    fake_rank_scores,
+                    torch.zeros_like(fake_rank_scores),
+                )
+            fake_loss = fake_loss / self.ranker_fake_repeats
+
+        loss = (
+            self.ranker_fake_weight * fake_loss
+            + self.ranker_weight * rank_loss
+            + self.utility_weight * value_loss
+        )
+        loss.backward()
+        self.gan.optimizerD.step()
+
+    def propose(self) -> torch.Tensor:
+        for _ in range(self.ranker_steps):
+            self._train_ranker_step()
+
+        self.gan.optimizerG.zero_grad()
+        z = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
+        proposals = self._generate(z, track_genomes=True)
+        rank_scores, _value_scores = split_rank_value_scores(self.gan.D(proposals))
+        loss = self.gan.loss(rank_scores, torch.ones_like(rank_scores))
+        if self.gan.curiosity_loss is not None:
+            loss = loss + self.gan.curiosity_loss(proposals)
+        loss.backward()
+        self.gan.optimizerG.step()
+        return self._select_ranked_exploration_proposals(proposals)
 
 
 def make_optimizer(
@@ -1672,6 +4579,45 @@ def make_optimizer(
     ranker_sample_pool_size: int | None = None,
     ranker_sample_mode: str = "random_top_pool",
     ranker_target_scope: str = "local",
+    ranker_list_repeats: int = 1,
+    ranker_fake_weight: float = 1.0,
+    ranker_fake_repeats: int = 1,
+    proposal_pool_size: int | None = None,
+    proposal_top_k: int | None = None,
+    proposal_diversity_min_hamming: float = 0.0,
+    proposal_diversity_topk_frac: float = 0.48,
+    proposal_buffer_novelty_min_hamming: float = 0.0,
+    proposal_buffer_novelty_reference_size: int = 128,
+    proposal_buffer_reject_exact_design_duplicates: bool = False,
+    design_proxy: DesignProxyFn | None = None,
+    proposal_evolution_fraction: float = 0.0,
+    proposal_evolution_parent_source: str = "pool",
+    proposal_evolution_crossover: str = "uniform",
+    proposal_evolution_mutation_rate: float = 0.01,
+    proposal_evolution_mutation_scale: float = 0.10,
+    proposal_evolution_grid_height: int | None = None,
+    proposal_evolution_grid_width: int | None = None,
+    proposal_gradient_steps: int = 0,
+    proposal_gradient_step_size: float = 0.05,
+    proposal_gradient_mode: str = "continuous",
+    proposal_gradient_normalize: bool = True,
+    proposal_gradient_noise: float = 0.0,
+    proposal_gradient_keep_original: bool = False,
+    ga_offspring_fraction: float = 0.0,
+    ga_pool_size: int | None = None,
+    ga_parent_pool_size: int = 128,
+    ga_mutation_rate: float = 0.02,
+    ga_mutation_scale: float = 0.25,
+    generator_elite_context_size: int = 0,
+    generator_elite_context_pool_size: int | None = None,
+    d_score_center_weight: float = 0.0,
+    d_score_scale_weight: float = 0.0,
+    d_score_target_std: float = 1.0,
+    utility_target_scale: float = 100.0,
+    utility_loss: str = "smooth_l1",
+    utility_weight: float = 0.1,
+    generator_utility_weight: float = 0.0,
+    utility_clip: float = 3.0,
 ) -> BaseOpt:
     if optimizer_type == "default":
         return DefaultOpt(opt_components)
@@ -1699,6 +4645,161 @@ def make_optimizer(
             generator_elite_margin=ranker_generator_elite_margin,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
+        )
+    if optimizer_type == "contextual_plackett_luce":
+        return ContextualPlackettLuceRankerOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=False,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
+            d_score_center_weight=d_score_center_weight,
+            d_score_scale_weight=d_score_scale_weight,
+            d_score_target_std=d_score_target_std,
+        )
+    if optimizer_type == "calibrated_utility":
+        return CalibratedUtilityRankerOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=False,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
+            d_score_center_weight=d_score_center_weight,
+            d_score_scale_weight=d_score_scale_weight,
+            d_score_target_std=d_score_target_std,
+            utility_target_scale=utility_target_scale,
+            utility_loss=utility_loss,
+        )
+    if optimizer_type == "hybrid_contextual_utility":
+        return HybridContextualUtilityRankerOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            generator_elite_margin=False,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
+            d_score_center_weight=d_score_center_weight,
+            d_score_scale_weight=d_score_scale_weight,
+            d_score_target_std=d_score_target_std,
+            utility_target_scale=utility_target_scale,
+            utility_loss=utility_loss,
+            utility_weight=utility_weight,
+            generator_utility_weight=generator_utility_weight,
+            utility_clip=utility_clip,
         )
     if optimizer_type == "ranked_lsgan":
         return RankedLSGANOpt(
@@ -1708,6 +4809,34 @@ def make_optimizer(
             ranker_weight=ranker_weight,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
     if optimizer_type == "ranked_default":
         return RankedDefaultOpt(
@@ -1717,6 +4846,34 @@ def make_optimizer(
             ranker_weight=ranker_weight,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
     if optimizer_type == "ranked_wgan":
         return RankedWGANOpt(
@@ -1726,6 +4883,30 @@ def make_optimizer(
             ranker_weight=ranker_weight,
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
     if optimizer_type == "quantile_ranked_default":
         return QuantileRankedDefaultOpt(
@@ -1738,6 +4919,85 @@ def make_optimizer(
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
             ranker_target_scope=ranker_target_scope,
+            ranker_list_repeats=ranker_list_repeats,
+            ranker_fake_weight=ranker_fake_weight,
+            ranker_fake_repeats=ranker_fake_repeats,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
+        )
+    if optimizer_type == "quantile_ranked_value_default":
+        return QuantileRankedValueDefaultOpt(
+            opt_components,
+            ranker_list_size=ranker_list_size,
+            ranker_steps=ranker_steps,
+            ranker_weight=ranker_weight,
+            ranker_target_curve=ranker_target_curve,
+            ranker_tau=ranker_tau,
+            ranker_sample_pool_size=ranker_sample_pool_size,
+            ranker_sample_mode=ranker_sample_mode,
+            ranker_target_scope=ranker_target_scope,
+            ranker_list_repeats=ranker_list_repeats,
+            ranker_fake_weight=ranker_fake_weight,
+            ranker_fake_repeats=ranker_fake_repeats,
+            utility_target_scale=utility_target_scale,
+            utility_loss=utility_loss,
+            utility_weight=utility_weight,
+            generator_utility_weight=generator_utility_weight,
+            utility_clip=utility_clip,
+            proposal_pool_size=proposal_pool_size,
+            proposal_top_k=proposal_top_k,
+            proposal_diversity_min_hamming=proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=design_proxy,
+            proposal_evolution_fraction=proposal_evolution_fraction,
+            proposal_evolution_parent_source=proposal_evolution_parent_source,
+            proposal_evolution_crossover=proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=proposal_evolution_grid_height,
+            proposal_evolution_grid_width=proposal_evolution_grid_width,
+            proposal_gradient_steps=proposal_gradient_steps,
+            proposal_gradient_step_size=proposal_gradient_step_size,
+            proposal_gradient_mode=proposal_gradient_mode,
+            proposal_gradient_normalize=proposal_gradient_normalize,
+            proposal_gradient_noise=proposal_gradient_noise,
+            proposal_gradient_keep_original=proposal_gradient_keep_original,
+            ga_offspring_fraction=ga_offspring_fraction,
+            ga_pool_size=ga_pool_size,
+            ga_parent_pool_size=ga_parent_pool_size,
+            ga_mutation_rate=ga_mutation_rate,
+            ga_mutation_scale=ga_mutation_scale,
+            generator_elite_context_size=generator_elite_context_size,
+            generator_elite_context_pool_size=generator_elite_context_pool_size,
         )
     raise ValueError(f"Unknown optimizer_type: {optimizer_type}")
 
@@ -1794,6 +5054,189 @@ def compliance_summary(
         "feasible_count": int(np.count_nonzero(feasible)),
         "feasible_rate": float(np.mean(feasible)),
     }
+
+
+def record_buffer_history(
+    buffer: Buffer,
+    *,
+    iteration: int,
+    eval_count: int,
+) -> dict[str, np.ndarray | float]:
+    """Capture cheap rank-buffer telemetry without extra FEM evaluations."""
+    values = np.asarray(buffer.get_sorted_values(), dtype=np.float32)
+    if values.ndim == 1:
+        values = values[:, None]
+    last_level = values[:, -1]
+    feasible_rate = float("nan")
+    best_feasible_last = float("nan")
+    mean_volume_violation = float("nan")
+    mean_roughness_violation = float("nan")
+    mean_connectivity_violation = float("nan")
+    if values.shape[1] >= 3:
+        volume_violation = values[:, -3]
+        roughness_violation = values[:, -2]
+        feasible = (volume_violation <= 1e-6) & (roughness_violation <= 1e-6)
+        feasible_rate = float(np.mean(feasible))
+        mean_volume_violation = float(np.mean(volume_violation))
+        mean_roughness_violation = float(np.mean(roughness_violation))
+        if np.any(feasible):
+            best_feasible_last = float(np.min(last_level[feasible]))
+    if values.shape[1] >= 4:
+        maybe_connectivity_violation = values[:, -4]
+        mean_connectivity_violation = float(np.mean(maybe_connectivity_violation))
+    return {
+        "iteration": float(iteration),
+        "eval_count": float(eval_count),
+        "best_values": values[0].copy(),
+        "best_last": float(last_level[0]),
+        "best_feasible_last": best_feasible_last,
+        "mean_last": float(np.mean(last_level)),
+        "median_last": float(np.median(last_level)),
+        "p10_last": float(np.percentile(last_level, 10)),
+        "p90_last": float(np.percentile(last_level, 90)),
+        "feasible_rate": feasible_rate,
+        "mean_volume_violation": mean_volume_violation,
+        "mean_roughness_violation": mean_roughness_violation,
+        "mean_connectivity_violation": mean_connectivity_violation,
+    }
+
+
+def history_arrays(
+    history: list[dict[str, np.ndarray | float]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    scalar_columns = [
+        "iteration",
+        "eval_count",
+        "best_last",
+        "best_feasible_last",
+        "mean_last",
+        "median_last",
+        "p10_last",
+        "p90_last",
+        "feasible_rate",
+        "mean_volume_violation",
+        "mean_roughness_violation",
+        "mean_connectivity_violation",
+    ]
+    scalars = np.asarray(
+        [[float(row[column]) for column in scalar_columns] for row in history],
+        dtype=np.float32,
+    )
+    best_values = np.asarray([row["best_values"] for row in history], dtype=np.float32)
+    return scalars, best_values, np.asarray(scalar_columns)
+
+
+def live_progress_payload(
+    row: dict[str, np.ndarray | float],
+    *,
+    start_time: float,
+    n_iter: int,
+) -> dict[str, Any]:
+    """Convert a history row to JSON-safe live telemetry."""
+    iteration = float(row["iteration"])
+    eval_count = float(row["eval_count"])
+    elapsed_sec = max(time.perf_counter() - start_time, 1e-9)
+    iter_per_sec = iteration / elapsed_sec
+    eta_sec = (
+        (float(n_iter) - iteration) / iter_per_sec
+        if iter_per_sec > 0 and iteration < n_iter
+        else 0.0
+    )
+
+    def finite_or_none(value: float) -> float | None:
+        value = float(value)
+        return value if math.isfinite(value) else None
+
+    return {
+        "iteration": int(iteration),
+        "n_iter": int(n_iter),
+        "eval_count": int(eval_count),
+        "best_last": finite_or_none(float(row["best_last"])),
+        "best_feasible_last": finite_or_none(float(row["best_feasible_last"])),
+        "mean_last": finite_or_none(float(row["mean_last"])),
+        "median_last": finite_or_none(float(row["median_last"])),
+        "p10_last": finite_or_none(float(row["p10_last"])),
+        "p90_last": finite_or_none(float(row["p90_last"])),
+        "feasible_rate": finite_or_none(float(row["feasible_rate"])),
+        "mean_volume_violation": finite_or_none(float(row["mean_volume_violation"])),
+        "mean_roughness_violation": finite_or_none(
+            float(row["mean_roughness_violation"])
+        ),
+        "mean_connectivity_violation": finite_or_none(
+            float(row["mean_connectivity_violation"])
+        ),
+        "best_values": [
+            finite_or_none(value)
+            for value in np.asarray(row["best_values"], dtype=np.float64).ravel()
+        ],
+        "elapsed_sec": elapsed_sec,
+        "iter_per_sec": iter_per_sec,
+        "evals_per_sec": eval_count / elapsed_sec,
+        "eta_sec": eta_sec,
+    }
+
+
+def plot_buffer_history(
+    history: list[dict[str, np.ndarray | float]],
+    output_path: Path,
+    *,
+    title: str,
+) -> None:
+    """Plot best/mean buffer behavior for the last value level."""
+    if not history:
+        return
+    scalars, _, columns = history_arrays(history)
+    column_index = {str(name): index for index, name in enumerate(columns)}
+    evals = scalars[:, column_index["eval_count"]]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(
+        evals,
+        scalars[:, column_index["best_last"]],
+        label="best buffer last-level",
+        linewidth=2.0,
+    )
+    ax.plot(
+        evals,
+        scalars[:, column_index["mean_last"]],
+        label="mean buffer last-level",
+        linewidth=1.5,
+    )
+    ax.plot(
+        evals,
+        scalars[:, column_index["median_last"]],
+        label="median buffer last-level",
+        linewidth=1.5,
+    )
+    ax.fill_between(
+        evals,
+        scalars[:, column_index["p10_last"]],
+        scalars[:, column_index["p90_last"]],
+        alpha=0.18,
+        label="p10-p90 buffer range",
+    )
+    ax.set_xlabel("objective evaluations")
+    ax.set_ylabel("buffer value, lower is better")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def parse_schedule_decay(decay: str | None) -> str | float | None:
+    """Parse optional scheduler cycle decay from CLI text."""
+    if decay is None or decay.lower() in {"", "none"}:
+        return None
+    if decay == "linear":
+        return decay
+    try:
+        return float(decay)
+    except ValueError as exc:
+        raise ValueError(
+            "--curiosity_decay must be none, linear, or a numeric factor"
+        ) from exc
 
 
 def zeropower_via_newton_schulz5(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -1890,6 +5333,50 @@ def make_torch_optimizer(
     raise ValueError(f"Unknown torch optimizer: {optimizer_name}")
 
 
+def run_generator_uniformity_warmup(
+    gan: components.GAN,
+    *,
+    steps: int,
+    batch_size: int,
+    weight: float,
+    t: float = 2.0,
+) -> None:
+    """Update only G with Wang-Isola uniformity before filling the buffer."""
+    if steps <= 0:
+        return
+    if batch_size < 2:
+        raise ValueError(
+            f"g_uniformity_warmup_batch_size must be >= 2, got {batch_size}"
+        )
+    if weight < 0:
+        raise ValueError(
+            f"g_uniformity_warmup_weight must be non-negative, got {weight}"
+        )
+    if not isinstance(gan.latent_dim, int):
+        raise ValueError("G uniformity warmup currently requires int latent_dim")
+
+    logger.info(
+        f"Running G-only uniformity warmup: steps={steps} batch_size={batch_size} "
+        f"weight={weight:g} t={t:g}"
+    )
+    for step in range(steps):
+        gan.optimizerG.zero_grad()
+        z = torch.randn(
+            batch_size,
+            gan.latent_dim,
+            device=gan.device,
+            dtype=gan.dtype,
+        )
+        proposals = gan.G(z)
+        loss = weight * uniformity_loss(proposals.reshape(batch_size, -1), t=t)
+        loss.backward()
+        gan.optimizerG.step()
+        if (step + 1) == steps or (step + 1) % max(1, steps // 5) == 0:
+            logger.info(
+                f"G-only uniformity warmup step {step + 1}/{steps}: loss={loss.item():.6f}"
+            )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GFog FEM cantilever benchmark")
     parser.add_argument(
@@ -1909,15 +5396,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument(
+        "--latent_distribution",
+        choices=["normal", "uniform"],
+        default="normal",
+        help="Latent prior used for fresh z samples and fixed-bank candidates.",
+    )
+    parser.add_argument("--latent_uniform_low", type=float, default=-1.0)
+    parser.add_argument("--latent_uniform_high", type=float, default=1.0)
+    parser.add_argument(
         "--encoding",
         choices=[
             "direct",
             "coarse",
             "binary_coarse",
             "topk_volume",
+            "sorted_material",
             "coarse_topk_volume",
             "coarse_residual",
             "soft_volume",
+            "bar_primitives",
             "tiny_decoder",
         ],
         default="direct",
@@ -1930,32 +5427,243 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tiny_decoder_latent_height", type=int, default=8)
     parser.add_argument("--tiny_decoder_latent_width", type=int, default=8)
     parser.add_argument("--tiny_decoder_latent_scale", type=float, default=1.0)
-    parser.add_argument("--generator_type", choices=["mlp", "conv"], default="mlp")
-    parser.add_argument("--discriminator_type", choices=["mlp", "conv"], default="mlp")
+    parser.add_argument("--bar_count", type=int, default=16)
+    parser.add_argument("--bar_width_min", type=float, default=0.02)
+    parser.add_argument("--bar_width_max", type=float, default=0.08)
+    parser.add_argument("--bar_edge_softness", type=float, default=0.01)
+    parser.add_argument(
+        "--sorted_material_profile",
+        choices=["binary", "linear", "sigmoid"],
+        default="linear",
+        help=(
+            "Fixed material histogram for --encoding sorted_material. "
+            "G controls only the sorted placement/order."
+        ),
+    )
+    parser.add_argument("--sorted_material_steepness", type=float, default=12.0)
+    parser.add_argument(
+        "--generator_type",
+        choices=["mlp", "conv", "set_conv", "set_direct"],
+        default="mlp",
+    )
+    parser.add_argument(
+        "--discriminator_type",
+        choices=["mlp", "conv", "set_transformer"],
+        default="mlp",
+    )
+    parser.add_argument(
+        "--discriminator_spectral_norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable spectral norm on MLP/Conv discriminator layers.",
+    )
+    parser.add_argument(
+        "--discriminator_activation",
+        choices=["leaky_relu", "gelu", "silu"],
+        default="leaky_relu",
+        help="Activation used by --discriminator_type conv.",
+    )
     parser.add_argument("--generator_channels", type=int, default=64)
+    parser.add_argument(
+        "--generator_output_norm",
+        choices=["none", "l2", "centered_l2", "layernorm"],
+        default="none",
+        help="Normalize each generated genome/score vector before evaluation and D.",
+    )
     parser.add_argument("--discriminator_channels", type=int, default=32)
+    parser.add_argument("--set_generator_dim", type=int, default=128)
+    parser.add_argument("--set_generator_depth", type=int, default=2)
+    parser.add_argument("--set_generator_heads", type=int, default=4)
+    parser.add_argument("--set_generator_mlp_ratio", type=int, default=2)
+    parser.add_argument("--set_generator_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--set_generator_elite_context_size",
+        type=int,
+        default=0,
+        help="Number of stochastic top-buffer elite designs exposed to set_conv G.",
+    )
+    parser.add_argument(
+        "--set_generator_elite_context_pool_size",
+        type=int,
+        default=None,
+        help="Sample set_conv G elite context from the top N buffer entries.",
+    )
+    parser.add_argument("--set_discriminator_dim", type=int, default=128)
+    parser.add_argument("--set_discriminator_depth", type=int, default=2)
+    parser.add_argument("--set_discriminator_heads", type=int, default=4)
+    parser.add_argument("--set_discriminator_mlp_ratio", type=int, default=2)
+    parser.add_argument("--set_discriminator_dropout", type=float, default=0.0)
     parser.add_argument(
         "--generator_hidden_dims", nargs="+", type=int, default=[128, 128]
     )
     parser.add_argument(
         "--discriminator_hidden_dims", nargs="+", type=int, default=[128, 128]
     )
+    parser.add_argument(
+        "--fixed_latent_bank",
+        action="store_true",
+        help=(
+            "Replace fresh Gaussian z samples with a fixed latent bank. "
+            "By default the bank size equals buffer_multiplier * batch_size."
+        ),
+    )
+    parser.add_argument("--fixed_latent_bank_size", type=int, default=None)
+    parser.add_argument(
+        "--fixed_latent_selection",
+        choices=["random", "output_diverse"],
+        default="output_diverse",
+        help="How to choose fixed latent bank entries from an initial random candidate pool.",
+    )
+    parser.add_argument(
+        "--fixed_latent_candidate_multiplier",
+        type=int,
+        default=8,
+        help="Candidate-pool multiplier for --fixed_latent_selection output_diverse.",
+    )
+    parser.add_argument(
+        "--fixed_latent_chunk_size",
+        type=int,
+        default=1024,
+        help="Chunk size for evaluating candidate latents during fixed-bank selection.",
+    )
+    parser.add_argument(
+        "--fixed_latent_sample_mode",
+        choices=["random", "shuffle_cycle"],
+        default="shuffle_cycle",
+        help="How optimizer batches are drawn from the fixed latent bank.",
+    )
+    parser.add_argument(
+        "--fixed_latent_noise_std",
+        type=float,
+        default=0.0,
+        help="Sample z around fixed bank means with this Gaussian stddev.",
+    )
+    parser.add_argument(
+        "--fixed_latent_noise_no_normalize",
+        action="store_true",
+        help="Do not divide jittered fixed latents by sqrt(1 + noise_std^2).",
+    )
+    parser.add_argument(
+        "--fixed_latent_uniformity_weight",
+        type=float,
+        default=0.0,
+        help="Extra G-side uniformity weight on G(z) sampled from the fixed latent bank.",
+    )
+    parser.add_argument(
+        "--fixed_latent_uniformity_batch_size",
+        type=int,
+        default=128,
+        help="Number of fixed-bank latents used by the extra bank uniformity loss.",
+    )
+    parser.add_argument("--fixed_latent_uniformity_t", type=float, default=2.0)
+    parser.add_argument(
+        "--fixed_latent_uniformity_sample_mode",
+        choices=["random", "shuffle_cycle"],
+        default="shuffle_cycle",
+    )
     parser.add_argument("--buffer_multiplier", type=int, default=2)
+    parser.add_argument(
+        "--buffer_diversity_min_hamming",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, rebuild the elite buffer as a ranked Hamming-diverse set. "
+            "Unfilled slots fall back to rank order."
+        ),
+    )
+    parser.add_argument(
+        "--buffer_diversity_topk_frac",
+        type=float,
+        default=0.48,
+        help="Top-k fraction used to binarize raw scores for buffer diversity.",
+    )
     parser.add_argument("--curiosity", type=float, default=10.0)
     parser.add_argument(
         "--curiosity_space",
-        choices=["raw", "topology"],
+        choices=["raw", "topology", "plummer"],
         default="raw",
-        help="Apply curiosity to raw generator outputs or decoded topology fields.",
+        help=(
+            "Apply curiosity to raw outputs, decoded topology fields, or a "
+            "Plummer repulsion kernel in genome space."
+        ),
+    )
+    parser.add_argument(
+        "--plummer_power",
+        type=float,
+        default=1.0,
+        help="Inverse-power exponent for --curiosity_space plummer.",
+    )
+    parser.add_argument(
+        "--plummer_eps",
+        type=float,
+        default=1e-3,
+        help="Softening constant added to mean squared distances for Plummer repulsion.",
+    )
+    parser.add_argument(
+        "--plummer_normalize",
+        choices=["none", "layernorm", "l2"],
+        default="layernorm",
+        help="Per-sample normalization before Plummer distances.",
+    )
+    parser.add_argument(
+        "--plummer_terms",
+        choices=["batch", "buffer", "batch_buffer"],
+        default="batch_buffer",
+        help=(
+            "Which Plummer repulsion terms to apply: generated batch only, "
+            "generated-vs-buffer only, or both."
+        ),
     )
     parser.add_argument(
         "--curiosity_schedule",
-        choices=["none", "warmup_cosine"],
+        choices=["none", "warmup_cosine", "warmup_cosine_annealing", "cosine_ramp"],
         default="none",
         help="Optional schedule multiplier for curiosity weight.",
     )
     parser.add_argument("--curiosity_warmup_frac", type=float, default=0.05)
     parser.add_argument("--curiosity_min", type=float, default=0.0)
+    parser.add_argument(
+        "--curiosity_cycles",
+        type=int,
+        default=4,
+        help="Number of cycles for --curiosity_schedule warmup_cosine_annealing.",
+    )
+    parser.add_argument(
+        "--curiosity_decay",
+        type=str,
+        default=None,
+        help=(
+            "Cycle peak decay for warmup_cosine_annealing: none, linear, "
+            "or a numeric factor such as 0.8."
+        ),
+    )
+    parser.add_argument(
+        "--g_uniformity_warmup_steps",
+        type=int,
+        default=0,
+        help="Run this many G-only uniformity updates before initial buffer filling.",
+    )
+    parser.add_argument(
+        "--g_uniformity_warmup_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for G-only uniformity warmup. Defaults to --batch_size.",
+    )
+    parser.add_argument(
+        "--g_uniformity_warmup_weight",
+        type=float,
+        default=None,
+        help=(
+            "Weight for G-only uniformity warmup. Defaults to --curiosity, "
+            "or 1 if curiosity is 0."
+        ),
+    )
+    parser.add_argument(
+        "--g_uniformity_warmup_t",
+        type=float,
+        default=2.0,
+        help="Wang-Isola t parameter for G-only uniformity warmup.",
+    )
     parser.add_argument(
         "--curiosity_reference",
         choices=["buffer", "batch"],
@@ -1981,10 +5689,14 @@ def build_parser() -> argparse.ArgumentParser:
             "wgangp",
             "plackett_luce",
             "buffer_plackett_luce",
+            "contextual_plackett_luce",
+            "calibrated_utility",
+            "hybrid_contextual_utility",
             "ranked_lsgan",
             "ranked_default",
             "ranked_wgan",
             "quantile_ranked_default",
+            "quantile_ranked_value_default",
         ],
         default="default",
     )
@@ -2029,6 +5741,225 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use local sampled-list ranks or global buffer ranks for quantile targets.",
     )
     parser.add_argument(
+        "--ranker_list_repeats",
+        type=int,
+        default=1,
+        help="Average this many independent rank lists inside one D update.",
+    )
+    parser.add_argument(
+        "--ranker_fake_weight",
+        type=float,
+        default=1.0,
+        help="Weight for the quantile-ranker D(fake)=0 term.",
+    )
+    parser.add_argument(
+        "--ranker_fake_repeats",
+        type=int,
+        default=1,
+        help="Average this many generated-fake batches inside one D update.",
+    )
+    parser.add_argument(
+        "--d_score_center_weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight for centering contextual PL D scores around zero.",
+    )
+    parser.add_argument(
+        "--d_score_scale_weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight for matching contextual PL D score std.",
+    )
+    parser.add_argument(
+        "--d_score_target_std",
+        type=float,
+        default=1.0,
+        help="Target standard deviation for contextual PL D score scale.",
+    )
+    parser.add_argument(
+        "--utility_target_scale",
+        type=float,
+        default=100.0,
+        help="Scale for calibrated utility target: utility = -last_objective / scale.",
+    )
+    parser.add_argument(
+        "--utility_loss",
+        choices=["smooth_l1", "mse"],
+        default="smooth_l1",
+        help="Regression loss for --optimizer_type calibrated_utility.",
+    )
+    parser.add_argument(
+        "--utility_weight",
+        type=float,
+        default=0.1,
+        help="D-side utility calibration weight for hybrid contextual utility.",
+    )
+    parser.add_argument(
+        "--generator_utility_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "G-side utility score maximization weight for hybrid contextual utility. "
+            "Must stay 0 for quantile_ranked_value_default."
+        ),
+    )
+    parser.add_argument(
+        "--utility_clip",
+        type=float,
+        default=3.0,
+        help="Clip local utility targets for hybrid contextual utility.",
+    )
+    parser.add_argument(
+        "--proposal_pool_size",
+        type=int,
+        default=None,
+        help="Generate this many proposals, score by D, then select the final batch.",
+    )
+    parser.add_argument(
+        "--proposal_top_k",
+        type=int,
+        default=None,
+        help="Prefilter proposal pool to top-k by D before diversity selection.",
+    )
+    parser.add_argument(
+        "--proposal_diversity_min_hamming",
+        type=float,
+        default=0.0,
+        help="Greedy Hamming-distance threshold for selected proposal batch.",
+    )
+    parser.add_argument(
+        "--proposal_diversity_topk_frac",
+        type=float,
+        default=0.48,
+        help="Top-k fraction used to binarize raw scores for proposal diversity.",
+    )
+    parser.add_argument(
+        "--proposal_buffer_novelty_min_hamming",
+        type=float,
+        default=0.0,
+        help=(
+            "Reject D-ranked proposal candidates whose decoded binary design is "
+            "closer than this Hamming distance to any top buffer reference."
+        ),
+    )
+    parser.add_argument(
+        "--proposal_buffer_novelty_reference_size",
+        type=int,
+        default=128,
+        help="Number of top buffer designs used as duplicate references.",
+    )
+    parser.add_argument(
+        "--proposal_buffer_reject_exact_design_duplicates",
+        action="store_true",
+        help=(
+            "Reject proposal candidates only when their decoded binary design "
+            "exactly matches a top buffer reference."
+        ),
+    )
+    parser.add_argument(
+        "--proposal_buffer_novelty_threshold",
+        type=float,
+        default=0.5,
+        help="Density threshold used to binarize decoded designs for novelty checks.",
+    )
+    parser.add_argument(
+        "--proposal_evolution_fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of the D-ranked proposal pool replaced by evolved children.",
+    )
+    parser.add_argument(
+        "--proposal_evolution_parent_source",
+        choices=["pool", "pool_buffer"],
+        default="pool",
+        help="Use only generated pool parents or mix generated proposals with buffer elites.",
+    )
+    parser.add_argument(
+        "--proposal_evolution_crossover",
+        choices=["uniform", "row", "rect"],
+        default="uniform",
+        help="Crossover operator for proposal-pool evolution.",
+    )
+    parser.add_argument(
+        "--proposal_evolution_mutation_rate",
+        type=float,
+        default=0.01,
+        help="Per-coordinate mutation probability for evolved proposal-pool children.",
+    )
+    parser.add_argument(
+        "--proposal_evolution_mutation_scale",
+        type=float,
+        default=0.10,
+        help="Gaussian mutation stddev for evolved proposal-pool children.",
+    )
+    parser.add_argument(
+        "--proposal_gradient_steps",
+        type=int,
+        default=0,
+        help="D-gradient ascent steps applied to proposal score maps before FEM.",
+    )
+    parser.add_argument(
+        "--proposal_gradient_step_size",
+        type=float,
+        default=0.05,
+        help=(
+            "Step size for continuous D-gradient refinement, or material fraction "
+            "to swap for --proposal_gradient_mode swap."
+        ),
+    )
+    parser.add_argument(
+        "--proposal_gradient_mode",
+        choices=["continuous", "swap"],
+        default="continuous",
+        help="Use continuous score ascent or top-k-preserving promote/demote swaps.",
+    )
+    parser.add_argument(
+        "--proposal_gradient_no_normalize",
+        action="store_true",
+        help="Use raw D gradients instead of per-sample normalized gradients.",
+    )
+    parser.add_argument(
+        "--proposal_gradient_noise",
+        type=float,
+        default=0.0,
+        help="Gaussian noise added after each D-gradient proposal refinement step.",
+    )
+    parser.add_argument(
+        "--proposal_gradient_keep_original",
+        action="store_true",
+        help="Rank both original and D-gradient-refined proposals before selection.",
+    )
+    parser.add_argument(
+        "--ga_offspring_fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of each evaluated ranker batch replaced by GA children.",
+    )
+    parser.add_argument(
+        "--ga_pool_size",
+        type=int,
+        default=None,
+        help="Number of GA children generated before D preselection.",
+    )
+    parser.add_argument(
+        "--ga_parent_pool_size",
+        type=int,
+        default=128,
+        help="Sample crossover parents from the top N buffer entries.",
+    )
+    parser.add_argument(
+        "--ga_mutation_rate",
+        type=float,
+        default=0.02,
+        help="Per-coordinate Gaussian mutation probability for GA children.",
+    )
+    parser.add_argument(
+        "--ga_mutation_scale",
+        type=float,
+        default=0.25,
+        help="Gaussian mutation stddev for GA children.",
+    )
+    parser.add_argument(
         "--g_torch_optimizer",
         choices=["adam", "adamw", "sgd", "rmsprop", "muon"],
         default="adam",
@@ -2059,9 +5990,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient_penalty_weight", type=float, default=10.0)
     parser.add_argument("--volume_max", type=float, default=0.48)
     parser.add_argument("--roughness_max", type=float, default=0.18)
+    parser.add_argument(
+        "--connectivity_max",
+        type=float,
+        default=None,
+        help=(
+            "Optional max disconnected solid fraction. When set, f adds a "
+            "connectivity violation objective before volume/roughness/compliance."
+        ),
+    )
     parser.add_argument("--volume_ladder", nargs="*", type=float, default=[])
     parser.add_argument("--compliance_ladder", nargs="*", type=float, default=[])
     parser.add_argument("--roughness_ladder", nargs="*", type=float, default=[])
+    parser.add_argument("--connectivity_ladder", nargs="*", type=float, default=[])
+    parser.add_argument(
+        "--removal_ladder_volumes",
+        nargs="*",
+        type=float,
+        default=[],
+        help=(
+            "Optional staged material-removal objective. G emits element "
+            "importance scores; f keeps top-k material at each listed volume."
+        ),
+    )
+    parser.add_argument(
+        "--removal_ladder_compliances",
+        nargs="*",
+        type=float,
+        default=[],
+        help=(
+            "Compliance thresholds for --removal_ladder_volumes. When set, f "
+            "returns per-stage violations plus final compliance tie-break."
+        ),
+    )
+    parser.add_argument(
+        "--removal_ladder_connectivity_max",
+        type=float,
+        default=None,
+        help=(
+            "Optional max disconnected solid fraction for every removal-ladder "
+            "stage. A value of 0 requires all kept material to be connected to "
+            "the left support before the stage compliance violation is compared."
+        ),
+    )
     parser.add_argument(
         "--ladder_sequence",
         nargs="*",
@@ -2092,8 +6063,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load_scale", type=float, default=1.0)
     parser.add_argument(
         "--load_case",
-        choices=["center_point", "tom_two_patches"],
+        choices=LOAD_CASE_CHOICES,
         default="center_point",
+    )
+    parser.add_argument(
+        "--robust_load_cases",
+        nargs="*",
+        choices=LOAD_CASE_CHOICES,
+        default=[],
+        help=(
+            "Evaluate each design under these load cases and use the aggregate "
+            "compliance as f's compliance objective. Empty keeps --load_case only."
+        ),
+    )
+    parser.add_argument(
+        "--robust_load_aggregate",
+        choices=["max", "mean", "cvar"],
+        default="max",
+        help="How to aggregate compliances across --robust_load_cases.",
+    )
+    parser.add_argument(
+        "--robust_load_cvar_frac",
+        type=float,
+        default=0.5,
+        help="Worst-case fraction used when --robust_load_aggregate cvar.",
     )
     parser.add_argument(
         "--fem_workers",
@@ -2106,9 +6099,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--projection_eta", type=float, default=0.5)
     parser.add_argument("--hard_binarize", action="store_true")
     parser.add_argument(
+        "--binhead_connect_support",
+        action="store_true",
+        help=(
+            "After binary top-k/sorted decoding, keep support-connected material "
+            "and refill removed cells near that component before FEM."
+        ),
+    )
+    parser.add_argument(
         "--output_dir",
         type=Path,
         default=Path("results/fem_cantilever"),
+    )
+    parser.add_argument(
+        "--history_interval",
+        type=int,
+        default=1,
+        help="Record buffer telemetry every N optimizer iterations.",
+    )
+    parser.add_argument(
+        "--design_history_top_k",
+        type=int,
+        default=9,
+        help=(
+            "Store this many decoded top-buffer designs at each history checkpoint. "
+            "Use 0 to disable design-history artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--no_live_progress",
+        action="store_true",
+        help=(
+            "Disable append-only live_progress_*.jsonl telemetry and periodic "
+            "progress log lines during optimization."
+        ),
+    )
+    parser.add_argument(
+        "--no_history_plot",
+        action="store_true",
+        help="Store history arrays but skip the PNG history plot.",
     )
     return parser
 
@@ -2148,10 +6177,99 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(
                 "--encoding tiny_decoder does not support --curiosity_space topology yet"
             )
+    if args.encoding == "bar_primitives":
+        if args.bar_count <= 0:
+            raise ValueError(f"--bar_count must be positive, got {args.bar_count}")
+        if args.bar_width_min <= 0:
+            raise ValueError(
+                f"--bar_width_min must be positive, got {args.bar_width_min}"
+            )
+        if args.bar_width_max < args.bar_width_min:
+            raise ValueError(
+                "--bar_width_max must be >= --bar_width_min, got "
+                f"{args.bar_width_max} < {args.bar_width_min}"
+            )
+        if args.bar_edge_softness <= 0:
+            raise ValueError(
+                f"--bar_edge_softness must be positive, got {args.bar_edge_softness}"
+            )
     if args.fem_workers < 1:
         raise ValueError(f"--fem_workers must be >= 1, got {args.fem_workers}")
     if args.backend == "torchfem" and args.fem_workers != 1:
         raise ValueError("--fem_workers > 1 is only supported for --backend scipy")
+    if args.robust_load_cvar_frac <= 0.0 or args.robust_load_cvar_frac > 1.0:
+        raise ValueError(
+            "--robust_load_cvar_frac must be in (0, 1], got "
+            f"{args.robust_load_cvar_frac}"
+        )
+    if args.backend == "torchfem" and args.robust_load_cases:
+        raise ValueError("--robust_load_cases is only supported for --backend scipy")
+    if args.removal_ladder_volumes:
+        if args.encoding not in {"topk_volume", "sorted_material"}:
+            raise ValueError(
+                "--removal_ladder_volumes currently requires --encoding "
+                "topk_volume or sorted_material so G emits one score per element"
+            )
+        for volume in args.removal_ladder_volumes:
+            if volume <= 0.0 or volume > 1.0:
+                raise ValueError(
+                    "removal ladder volumes must be in (0, 1], got " f"{volume}"
+                )
+        if args.removal_ladder_compliances and (
+            len(args.removal_ladder_compliances) != len(args.removal_ladder_volumes)
+        ):
+            raise ValueError(
+                "--removal_ladder_compliances must have the same length as "
+                "--removal_ladder_volumes"
+            )
+        if args.removal_ladder_connectivity_max is not None and (
+            args.removal_ladder_connectivity_max < 0.0
+            or args.removal_ladder_connectivity_max > 1.0
+        ):
+            raise ValueError(
+                "--removal_ladder_connectivity_max must be in [0, 1], got "
+                f"{args.removal_ladder_connectivity_max}"
+            )
+        if (
+            args.volume_ladder
+            or args.compliance_ladder
+            or args.roughness_ladder
+            or args.connectivity_ladder
+            or args.ladder_sequence
+            or args.levels_ladder
+        ):
+            raise ValueError(
+                "--removal_ladder_volumes cannot be combined with other ladder args"
+            )
+    if (
+        args.curiosity_space == "plummer"
+        and args.plummer_terms == "buffer"
+        and args.curiosity_reference != "buffer"
+    ):
+        raise ValueError("--plummer_terms buffer requires --curiosity_reference buffer")
+    if args.history_interval < 1:
+        raise ValueError(
+            f"--history_interval must be >= 1, got {args.history_interval}"
+        )
+    if args.design_history_top_k < 0:
+        raise ValueError(
+            f"--design_history_top_k must be non-negative, got {args.design_history_top_k}"
+        )
+    if args.proposal_buffer_novelty_min_hamming < 0:
+        raise ValueError(
+            "--proposal_buffer_novelty_min_hamming must be non-negative, got "
+            f"{args.proposal_buffer_novelty_min_hamming}"
+        )
+    if args.proposal_buffer_novelty_reference_size < 1:
+        raise ValueError(
+            "--proposal_buffer_novelty_reference_size must be >= 1, got "
+            f"{args.proposal_buffer_novelty_reference_size}"
+        )
+    if not 0.0 <= args.proposal_buffer_novelty_threshold <= 1.0:
+        raise ValueError(
+            "--proposal_buffer_novelty_threshold must be in [0, 1], got "
+            f"{args.proposal_buffer_novelty_threshold}"
+        )
 
     ladder_sequence = parse_ladder_sequence(args.ladder_sequence)
     levels_ladder_rungs = parse_levels_ladder_specs(args.levels_ladder)
@@ -2159,10 +6277,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         args.volume_ladder
         or args.compliance_ladder
         or args.roughness_ladder
+        or args.connectivity_ladder
         or ladder_sequence
+        or args.connectivity_max is not None
     ):
         raise ValueError(
-            "--levels_ladder cannot be combined with topology-specific ladder args"
+            "--levels_ladder cannot be combined with topology-specific ladder/connectivity args"
         )
 
     cfg = FEMConfig(
@@ -2180,24 +6300,39 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         poisson_ratio=args.poisson_ratio,
         volume_max=args.volume_max,
         roughness_max=args.roughness_max,
+        connectivity_max=args.connectivity_max,
         volume_ladder=tuple(args.volume_ladder),
         compliance_ladder=tuple(args.compliance_ladder),
         roughness_ladder=tuple(args.roughness_ladder),
+        connectivity_ladder=tuple(args.connectivity_ladder),
         ladder_sequence=ladder_sequence,
         use_levels_ladder=bool(levels_ladder_rungs),
         levels_ladder_objectives=tuple(rung.name for rung in levels_ladder_rungs),
         load_scale=args.load_scale,
         load_case=args.load_case,
+        robust_load_cases=tuple(args.robust_load_cases),
+        robust_load_aggregate=args.robust_load_aggregate,
+        robust_load_cvar_frac=args.robust_load_cvar_frac,
+        removal_ladder_volumes=tuple(args.removal_ladder_volumes),
+        removal_ladder_compliances=tuple(args.removal_ladder_compliances),
+        removal_ladder_connectivity_max=args.removal_ladder_connectivity_max,
         fem_workers=args.fem_workers,
         density_filter_radius=args.density_filter_radius,
         projection_beta=args.projection_beta,
         projection_eta=args.projection_eta,
         hard_binarize=args.hard_binarize,
+        binhead_connect_support=args.binhead_connect_support,
         tiny_decoder_model=args.tiny_decoder_model,
         tiny_decoder_latent_channels=args.tiny_decoder_latent_channels,
         tiny_decoder_latent_height=args.tiny_decoder_latent_height,
         tiny_decoder_latent_width=args.tiny_decoder_latent_width,
         tiny_decoder_latent_scale=args.tiny_decoder_latent_scale,
+        bar_count=args.bar_count,
+        bar_width_min=args.bar_width_min,
+        bar_width_max=args.bar_width_max,
+        bar_edge_softness=args.bar_edge_softness,
+        sorted_material_profile=args.sorted_material_profile,
+        sorted_material_steepness=args.sorted_material_steepness,
     )
     if args.backend == "scipy":
         evaluator = FEMCantileverEvaluator(cfg)
@@ -2217,7 +6352,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         code_height = args.tiny_decoder_latent_height
         code_width = args.tiny_decoder_latent_width
         code_channels = args.tiny_decoder_latent_channels
-    elif args.encoding in {"direct", "soft_volume", "topk_volume"}:
+    elif args.encoding == "bar_primitives":
+        code_height = 1
+        code_width = 5 * args.bar_count
+    elif args.encoding in {"direct", "soft_volume", "topk_volume", "sorted_material"}:
         code_height = args.grid_height
         code_width = args.grid_width
     coarse_dim = code_channels * code_height * code_width
@@ -2225,6 +6363,16 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     f_dim = coarse_dim + full_dim if args.encoding == "coarse_residual" else coarse_dim
     d_input_dim = full_dim if args.train_on_decoded else f_dim
     device = torch.device("cpu")
+    proposal_design_proxy: DesignProxyFn | None = None
+    if (
+        args.proposal_buffer_novelty_min_hamming > 0
+        or args.proposal_buffer_reject_exact_design_duplicates
+    ):
+        novelty_threshold = args.proposal_buffer_novelty_threshold
+
+        def proposal_design_proxy(candidates: torch.Tensor) -> torch.Tensor:
+            designs = evaluator.decode_designs_numpy(candidates.detach().cpu().numpy())
+            return torch.from_numpy(designs >= novelty_threshold)
 
     fn = components.Fn(f=evaluator, input_dim=f_dim, device=device, dtype=torch.float32)
     if args.generator_type == "mlp":
@@ -2242,16 +6390,54 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             output_width=code_width,
             channels=args.generator_channels,
         ).to(device)
+    elif args.generator_type == "set_conv":
+        if args.encoding == "coarse_residual":
+            raise ValueError(
+                "--generator_type set_conv does not support coarse_residual"
+            )
+        g = SetTransformerConvGenerator(
+            latent_dim=args.latent_dim,
+            output_height=code_height,
+            output_width=code_width,
+            channels=args.generator_channels,
+            model_dim=args.set_generator_dim,
+            depth=args.set_generator_depth,
+            heads=args.set_generator_heads,
+            mlp_ratio=args.set_generator_mlp_ratio,
+            dropout=args.set_generator_dropout,
+        ).to(device)
+    elif args.generator_type == "set_direct":
+        g = SetTransformerDirectGenerator(
+            latent_dim=args.latent_dim,
+            output_dim=f_dim,
+            model_dim=args.set_generator_dim,
+            depth=args.set_generator_depth,
+            heads=args.set_generator_heads,
+            mlp_ratio=args.set_generator_mlp_ratio,
+            dropout=args.set_generator_dropout,
+        ).to(device)
     else:
         raise ValueError(f"Unknown generator_type: {args.generator_type}")
+    if args.generator_output_norm != "none":
+        g = NormalizedGenerator(g, mode=args.generator_output_norm).to(device)
 
+    discriminator_output_dim = (
+        2 if args.optimizer_type == "quantile_ranked_value_default" else 1
+    )
     if args.discriminator_type == "mlp":
-        d = MLP(
-            input_dim=d_input_dim,
-            output_dim=1,
-            hidden_dims=args.discriminator_hidden_dims,
-            use_spectral_norm=True,
-        ).to(device)
+        if args.optimizer_type == "quantile_ranked_value_default":
+            d = RankValueMLP(
+                input_dim=d_input_dim,
+                hidden_dims=args.discriminator_hidden_dims,
+                use_spectral_norm=args.discriminator_spectral_norm,
+            ).to(device)
+        else:
+            d = MLP(
+                input_dim=d_input_dim,
+                output_dim=discriminator_output_dim,
+                hidden_dims=args.discriminator_hidden_dims,
+                use_spectral_norm=args.discriminator_spectral_norm,
+            ).to(device)
     elif args.discriminator_type == "conv":
         if args.train_on_decoded:
             d_height = args.grid_height
@@ -2267,12 +6453,33 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             input_height=d_height,
             input_width=d_width,
             channels=args.discriminator_channels,
-            use_spectral_norm=True,
+            use_spectral_norm=args.discriminator_spectral_norm,
+            activation=args.discriminator_activation,
+            output_dim=discriminator_output_dim,
+        ).to(device)
+    elif args.discriminator_type == "set_transformer":
+        d = SetTransformerDiscriminator(
+            input_dim=d_input_dim,
+            model_dim=args.set_discriminator_dim,
+            depth=args.set_discriminator_depth,
+            heads=args.set_discriminator_heads,
+            mlp_ratio=args.set_discriminator_mlp_ratio,
+            dropout=args.set_discriminator_dropout,
+            output_dim=discriminator_output_dim,
         ).to(device)
     else:
         raise ValueError(f"Unknown discriminator_type: {args.discriminator_type}")
 
-    if levels_ladder_rungs:
+    if args.removal_ladder_volumes:
+        stage_names = []
+        for volume in args.removal_ladder_volumes:
+            if args.removal_ladder_connectivity_max is not None:
+                stage_names.append(f"removal_conn_v{volume:g}")
+            stage_names.append(f"removal_comp_v{volume:g}")
+        value_levels = Levels(
+            [*stage_names, "volume_violation", "roughness_violation", "compliance"]
+        )
+    elif levels_ladder_rungs:
         objective_names = [rung.name for rung in levels_ladder_rungs]
         final_open = args.levels_ladder_final_open
         if final_open == "":
@@ -2289,14 +6496,25 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             args.volume_ladder,
             args.compliance_ladder,
             args.roughness_ladder,
+            args.connectivity_ladder,
+            args.connectivity_max,
             ladder_sequence,
         )
         value_levels = Levels(level_names)
-    buffer = components.BufferComp(
-        B=Buffer(
-            buffer_size=args.buffer_multiplier * args.batch_size,
-            value_levels=value_levels,
+    base_buffer = Buffer(
+        buffer_size=args.buffer_multiplier * args.batch_size,
+        value_levels=value_levels,
+    )
+    if args.buffer_diversity_min_hamming > 0:
+        buffer_impl = DiverseEliteBuffer(
+            base_buffer,
+            min_hamming=args.buffer_diversity_min_hamming,
+            topk_frac=args.buffer_diversity_topk_frac,
         )
+    else:
+        buffer_impl = base_buffer
+    buffer = components.BufferComp(
+        B=buffer_impl,
     )
 
     curiosity_scheduler = None
@@ -2304,6 +6522,21 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         curiosity_scheduler = WarmupCosine(
             total_steps=args.n_iter,
             warmup_frac=args.curiosity_warmup_frac,
+            base=1.0,
+            min_val=args.curiosity_min,
+        )
+    elif args.curiosity > 0 and args.curiosity_schedule == "warmup_cosine_annealing":
+        curiosity_scheduler = WarmupCosineAnnealing(
+            total_steps=args.n_iter,
+            cycles=args.curiosity_cycles,
+            warmup_frac=args.curiosity_warmup_frac,
+            base=1.0,
+            min_val=args.curiosity_min,
+            decay=parse_schedule_decay(args.curiosity_decay),
+        )
+    elif args.curiosity > 0 and args.curiosity_schedule == "cosine_ramp":
+        curiosity_scheduler = CosineRamp(
+            total_steps=args.n_iter,
             base=1.0,
             min_val=args.curiosity_min,
         )
@@ -2330,6 +6563,17 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 use_buffer=curiosity_use_buffer,
                 scheduler=curiosity_scheduler,
             )
+        elif args.curiosity_space == "plummer":
+            curiosity_loss = PlummerEmbeddingRepulsion(
+                buffer=buffer.B,
+                weight=args.curiosity,
+                power=args.plummer_power,
+                eps=args.plummer_eps,
+                normalize=args.plummer_normalize,
+                terms=args.plummer_terms,
+                use_buffer=curiosity_use_buffer,
+                scheduler=curiosity_scheduler,
+            )
         else:
             raise ValueError(f"Unknown curiosity_space: {args.curiosity_space}")
 
@@ -2352,11 +6596,112 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             momentum=args.d_momentum,
         ),
         latent_sampler=LatentSamplerLambda(
-            lambda b, d: torch.randn(b, d), b=args.batch_size, d=args.latent_dim
+            lambda b, d, distribution, uniform_low, uniform_high: sample_latents(
+                b,
+                d,
+                distribution=distribution,
+                uniform_low=uniform_low,
+                uniform_high=uniform_high,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            ),
+            b=args.batch_size,
+            d=args.latent_dim,
+            distribution=args.latent_distribution,
+            uniform_low=args.latent_uniform_low,
+            uniform_high=args.latent_uniform_high,
         ),
         device=device,
         dtype=torch.float32,
     )
+    warmup_batch_size = args.g_uniformity_warmup_batch_size or args.batch_size
+    warmup_weight = (
+        args.g_uniformity_warmup_weight
+        if args.g_uniformity_warmup_weight is not None
+        else (args.curiosity if args.curiosity > 0 else 1.0)
+    )
+    run_generator_uniformity_warmup(
+        gan,
+        steps=args.g_uniformity_warmup_steps,
+        batch_size=warmup_batch_size,
+        weight=warmup_weight,
+        t=args.g_uniformity_warmup_t,
+    )
+    fixed_latent_bank_size = 0
+    fixed_latent_uniformity_active = False
+    if args.fixed_latent_bank:
+        if not isinstance(gan.latent_dim, int):
+            raise ValueError("--fixed_latent_bank requires an integer latent_dim")
+        fixed_latent_bank_size = (
+            args.fixed_latent_bank_size
+            if args.fixed_latent_bank_size is not None
+            else buffer.B.buffer_size
+        )
+        if args.fixed_latent_selection == "output_diverse":
+            latent_bank = select_output_diverse_latent_bank(
+                gan.G,
+                latent_dim=gan.latent_dim,
+                bank_size=fixed_latent_bank_size,
+                candidate_multiplier=args.fixed_latent_candidate_multiplier,
+                chunk_size=args.fixed_latent_chunk_size,
+                distribution=args.latent_distribution,
+                uniform_low=args.latent_uniform_low,
+                uniform_high=args.latent_uniform_high,
+                device=device,
+                dtype=torch.float32,
+            )
+        elif args.fixed_latent_selection == "random":
+            latent_bank = sample_latents(
+                fixed_latent_bank_size,
+                gan.latent_dim,
+                distribution=args.latent_distribution,
+                uniform_low=args.latent_uniform_low,
+                uniform_high=args.latent_uniform_high,
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            raise ValueError(
+                f"Unknown fixed_latent_selection: {args.fixed_latent_selection}"
+            )
+        gan.latent_sampler = FixedLatentBankSampler(
+            latent_bank,
+            batch_size=args.batch_size,
+            mode=args.fixed_latent_sample_mode,
+            noise_std=args.fixed_latent_noise_std,
+            normalize_noise_scale=not args.fixed_latent_noise_no_normalize,
+        )
+        if args.fixed_latent_uniformity_weight > 0:
+            existing_losses = []
+            if gan.curiosity_loss is not None:
+                existing_losses.append(gan.curiosity_loss)
+            existing_losses.append(
+                FixedLatentBankUniformity(
+                    gan.G,
+                    latent_bank,
+                    weight=args.fixed_latent_uniformity_weight,
+                    batch_size=args.fixed_latent_uniformity_batch_size,
+                    t=args.fixed_latent_uniformity_t,
+                    sample_mode=args.fixed_latent_uniformity_sample_mode,
+                )
+            )
+            gan.curiosity_loss = CombinedCuriosityLoss(existing_losses)
+            fixed_latent_uniformity_active = True
+        logger.info(
+            "Using fixed latent bank: "
+            f"size={fixed_latent_bank_size} selection={args.fixed_latent_selection} "
+            f"candidate_multiplier={args.fixed_latent_candidate_multiplier} "
+            f"sample_mode={args.fixed_latent_sample_mode} "
+            f"noise_std={args.fixed_latent_noise_std} "
+            f"noise_normalize={not args.fixed_latent_noise_no_normalize} "
+            f"uniformity_weight={args.fixed_latent_uniformity_weight} "
+            f"uniformity_batch_size={args.fixed_latent_uniformity_batch_size} "
+            f"uniformity_sample_mode={args.fixed_latent_uniformity_sample_mode}"
+        )
+    elif args.fixed_latent_uniformity_weight > 0:
+        raise ValueError(
+            "--fixed_latent_uniformity_weight requires --fixed_latent_bank"
+        )
 
     opt_components = components.OptComponents(
         fn=fn,
@@ -2397,15 +6742,178 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             ranker_sample_pool_size=args.ranker_sample_pool_size,
             ranker_sample_mode=args.ranker_sample_mode,
             ranker_target_scope=args.ranker_target_scope,
+            ranker_list_repeats=args.ranker_list_repeats,
+            ranker_fake_weight=args.ranker_fake_weight,
+            ranker_fake_repeats=args.ranker_fake_repeats,
+            d_score_center_weight=args.d_score_center_weight,
+            d_score_scale_weight=args.d_score_scale_weight,
+            d_score_target_std=args.d_score_target_std,
+            utility_target_scale=args.utility_target_scale,
+            utility_loss=args.utility_loss,
+            utility_weight=args.utility_weight,
+            generator_utility_weight=args.generator_utility_weight,
+            utility_clip=args.utility_clip,
+            proposal_pool_size=args.proposal_pool_size,
+            proposal_top_k=args.proposal_top_k,
+            proposal_diversity_min_hamming=args.proposal_diversity_min_hamming,
+            proposal_diversity_topk_frac=args.proposal_diversity_topk_frac,
+            proposal_buffer_novelty_min_hamming=args.proposal_buffer_novelty_min_hamming,
+            proposal_buffer_novelty_reference_size=args.proposal_buffer_novelty_reference_size,
+            proposal_buffer_reject_exact_design_duplicates=args.proposal_buffer_reject_exact_design_duplicates,
+            design_proxy=proposal_design_proxy,
+            proposal_evolution_fraction=args.proposal_evolution_fraction,
+            proposal_evolution_parent_source=args.proposal_evolution_parent_source,
+            proposal_evolution_crossover=args.proposal_evolution_crossover,
+            proposal_evolution_mutation_rate=args.proposal_evolution_mutation_rate,
+            proposal_evolution_mutation_scale=args.proposal_evolution_mutation_scale,
+            proposal_evolution_grid_height=code_height
+            if f_dim == code_height * code_width
+            else None,
+            proposal_evolution_grid_width=code_width
+            if f_dim == code_height * code_width
+            else None,
+            proposal_gradient_steps=args.proposal_gradient_steps,
+            proposal_gradient_step_size=args.proposal_gradient_step_size,
+            proposal_gradient_mode=args.proposal_gradient_mode,
+            proposal_gradient_normalize=not args.proposal_gradient_no_normalize,
+            proposal_gradient_noise=args.proposal_gradient_noise,
+            proposal_gradient_keep_original=args.proposal_gradient_keep_original,
+            ga_offspring_fraction=args.ga_offspring_fraction,
+            ga_pool_size=args.ga_pool_size,
+            ga_parent_pool_size=args.ga_parent_pool_size,
+            ga_mutation_rate=args.ga_mutation_rate,
+            ga_mutation_scale=args.ga_mutation_scale,
+            generator_elite_context_size=args.set_generator_elite_context_size,
+            generator_elite_context_pool_size=args.set_generator_elite_context_pool_size,
         )
 
     logger.info(
         f"FEMCantilever: preset={args.preset} grid={args.grid_width}x{args.grid_height} domain={args.domain_width:g}x{args.domain_height:g} code_grid={code_width}x{code_height} backend={args.backend} encoding={args.encoding} optimizer={args.optimizer_type} n_iter={args.n_iter} "
-        f"G={args.generator_type} D={args.discriminator_type} "
-        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_reference={args.curiosity_reference} curiosity_schedule={args.curiosity_schedule} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} elite_sampling={args.elite_sampling} elite_pool_size={args.elite_pool_size} ranker_list_size={args.ranker_list_size} ranker_steps={args.ranker_steps} ranker_weight={args.ranker_weight} ranker_target_curve={args.ranker_target_curve} ranker_tau={args.ranker_tau} ranker_target_scope={args.ranker_target_scope} ranker_sample_pool_size={args.ranker_sample_pool_size} ranker_sample_mode={args.ranker_sample_mode} load_case={args.load_case} load_scale={args.load_scale} fem_workers={args.fem_workers} filter_radius={args.density_filter_radius} residual_scale={args.residual_scale} "
-        f"projection_beta={args.projection_beta} hard_binarize={args.hard_binarize} train_on_decoded={args.train_on_decoded}"
+        f"latent_distribution={args.latent_distribution} latent_uniform=[{args.latent_uniform_low:g},{args.latent_uniform_high:g}] "
+        f"G={args.generator_type} G_norm={args.generator_output_norm} D={args.discriminator_type} "
+        f"D_spectral_norm={args.discriminator_spectral_norm} D_activation={args.discriminator_activation} "
+        f"fixed_latent_bank={args.fixed_latent_bank} fixed_latent_bank_size={fixed_latent_bank_size} fixed_latent_selection={args.fixed_latent_selection} fixed_latent_sample_mode={args.fixed_latent_sample_mode} fixed_latent_noise_std={args.fixed_latent_noise_std} fixed_latent_noise_normalize={not args.fixed_latent_noise_no_normalize} fixed_latent_uniformity_active={fixed_latent_uniformity_active} fixed_latent_uniformity_weight={args.fixed_latent_uniformity_weight} fixed_latent_uniformity_batch_size={args.fixed_latent_uniformity_batch_size} "
+        f"setG_dim={args.set_generator_dim} setG_depth={args.set_generator_depth} setG_heads={args.set_generator_heads} setG_elite_context={args.set_generator_elite_context_size} setG_elite_pool={args.set_generator_elite_context_pool_size} "
+        f"setD_dim={args.set_discriminator_dim} setD_depth={args.set_discriminator_depth} setD_heads={args.set_discriminator_heads} "
+        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_reference={args.curiosity_reference} curiosity_schedule={args.curiosity_schedule} curiosity_cycles={args.curiosity_cycles} curiosity_decay={args.curiosity_decay} plummer_power={args.plummer_power} plummer_eps={args.plummer_eps} plummer_normalize={args.plummer_normalize} plummer_terms={args.plummer_terms} g_uniformity_warmup_steps={args.g_uniformity_warmup_steps} g_uniformity_warmup_batch_size={warmup_batch_size} g_uniformity_warmup_weight={warmup_weight} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} buffer_diversity_min_hamming={args.buffer_diversity_min_hamming} buffer_diversity_topk_frac={args.buffer_diversity_topk_frac} elite_sampling={args.elite_sampling} elite_pool_size={args.elite_pool_size} ranker_list_size={args.ranker_list_size} ranker_steps={args.ranker_steps} ranker_weight={args.ranker_weight} ranker_target_curve={args.ranker_target_curve} ranker_tau={args.ranker_tau} ranker_target_scope={args.ranker_target_scope} ranker_list_repeats={args.ranker_list_repeats} ranker_fake_weight={args.ranker_fake_weight} ranker_fake_repeats={args.ranker_fake_repeats} ranker_sample_pool_size={args.ranker_sample_pool_size} ranker_sample_mode={args.ranker_sample_mode} d_score_center_weight={args.d_score_center_weight} d_score_scale_weight={args.d_score_scale_weight} d_score_target_std={args.d_score_target_std} utility_target_scale={args.utility_target_scale} utility_loss={args.utility_loss} utility_weight={args.utility_weight} generator_utility_weight={args.generator_utility_weight} utility_clip={args.utility_clip} proposal_pool_size={args.proposal_pool_size} proposal_top_k={args.proposal_top_k} proposal_diversity_min_hamming={args.proposal_diversity_min_hamming} proposal_buffer_novelty_min_hamming={args.proposal_buffer_novelty_min_hamming} proposal_buffer_novelty_reference_size={args.proposal_buffer_novelty_reference_size} proposal_buffer_reject_exact_design_duplicates={args.proposal_buffer_reject_exact_design_duplicates} proposal_buffer_novelty_threshold={args.proposal_buffer_novelty_threshold} proposal_evolution_fraction={args.proposal_evolution_fraction} proposal_evolution_parent_source={args.proposal_evolution_parent_source} proposal_evolution_crossover={args.proposal_evolution_crossover} proposal_evolution_mutation_rate={args.proposal_evolution_mutation_rate} proposal_evolution_mutation_scale={args.proposal_evolution_mutation_scale} proposal_gradient_steps={args.proposal_gradient_steps} proposal_gradient_step_size={args.proposal_gradient_step_size} proposal_gradient_mode={args.proposal_gradient_mode} proposal_gradient_normalize={not args.proposal_gradient_no_normalize} proposal_gradient_noise={args.proposal_gradient_noise} proposal_gradient_keep_original={args.proposal_gradient_keep_original} ga_offspring_fraction={args.ga_offspring_fraction} ga_pool_size={args.ga_pool_size} ga_parent_pool_size={args.ga_parent_pool_size} ga_mutation_rate={args.ga_mutation_rate} ga_mutation_scale={args.ga_mutation_scale} load_case={args.load_case} robust_load_cases={args.robust_load_cases} robust_load_aggregate={args.robust_load_aggregate} robust_load_cvar_frac={args.robust_load_cvar_frac} removal_ladder_volumes={args.removal_ladder_volumes} removal_ladder_compliances={args.removal_ladder_compliances} removal_ladder_connectivity_max={args.removal_ladder_connectivity_max} load_scale={args.load_scale} fem_workers={args.fem_workers} filter_radius={args.density_filter_radius} residual_scale={args.residual_scale} "
+        f"projection_beta={args.projection_beta} hard_binarize={args.hard_binarize} binhead_connect_support={args.binhead_connect_support} train_on_decoded={args.train_on_decoded}"
     )
-    optimizer.optimize(args.n_iter, verbose=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"curiosity_{args.curiosity:g}_seed_{args.seed}"
+    live_progress_path = args.output_dir / f"live_progress_{suffix}.jsonl"
+    live_latest_path = args.output_dir / f"live_progress_latest_{suffix}.json"
+    live_progress_enabled = not args.no_live_progress
+    live_start_time = time.perf_counter()
+    if live_progress_enabled:
+        live_progress_path.write_text("", encoding="utf-8")
+
+    init_eval_count = (
+        math.ceil(buffer.B.buffer_size / args.batch_size) * args.batch_size
+    )
+    history = [
+        record_buffer_history(
+            buffer.B,
+            iteration=0,
+            eval_count=init_eval_count,
+        )
+    ]
+    design_history: list[np.ndarray] = []
+    design_history_values: list[np.ndarray] = []
+    design_history_raw_code: list[np.ndarray] = []
+    design_history_iterations: list[float] = []
+    design_history_eval_counts: list[float] = []
+
+    def write_live_progress(row: dict[str, np.ndarray | float]) -> None:
+        if not live_progress_enabled:
+            return
+        payload = live_progress_payload(
+            row,
+            start_time=live_start_time,
+            n_iter=args.n_iter,
+        )
+        with live_progress_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        tmp_latest_path = live_latest_path.with_suffix(live_latest_path.suffix + ".tmp")
+        tmp_latest_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        tmp_latest_path.replace(live_latest_path)
+        eta_min = payload["eta_sec"] / 60.0
+        logger.info(
+            "Progress "
+            f"iter={payload['iteration']}/{payload['n_iter']} "
+            f"evals={payload['eval_count']} "
+            f"best={payload['best_last']:.6g} "
+            f"best_feasible={payload['best_feasible_last']} "
+            f"mean={payload['mean_last']:.6g} "
+            f"feasible={payload['feasible_rate']} "
+            f"eta_min={eta_min:.1f} "
+            f"live={live_latest_path}"
+        )
+
+    def record_design_history_checkpoint(iteration: int, eval_count: int) -> None:
+        if args.design_history_top_k <= 0:
+            return
+        history_top_k = min(args.design_history_top_k, len(buffer.B))
+        if history_top_k <= 0:
+            return
+        tensors = buffer.B.get_top_k(history_top_k).detach().cpu()
+        values = np.asarray(
+            buffer.B.get_sorted_values()[:history_top_k],
+            dtype=np.float32,
+        )
+        if args.train_on_decoded:
+            designs_np = tensors.reshape(
+                history_top_k,
+                args.grid_height,
+                args.grid_width,
+            ).numpy()
+        else:
+            designs_np = evaluator.decode_designs_numpy(tensors.numpy())
+        design_history.append(designs_np.astype(np.float32, copy=False))
+        design_history_values.append(values)
+        design_history_raw_code.append(tensors.numpy().astype(np.float32, copy=False))
+        design_history_iterations.append(float(iteration))
+        design_history_eval_counts.append(float(eval_count))
+
+    write_live_progress(history[-1])
+    record_design_history_checkpoint(iteration=0, eval_count=init_eval_count)
+    progress = Progress(
+        TextColumn("Iteration {task.completed}"),
+        BarColumn(),
+        TextColumn("Best: {task.fields[best]:.4f}"),
+        TextColumn("Mean: {task.fields[mean]:.4f}"),
+        TimeElapsedColumn(),
+    )
+    with progress:
+        task = progress.add_task(
+            "Optimizing",
+            total=args.n_iter,
+            best=buffer.B.get_value(0, level=-1),
+            mean=buffer.B.get_mean_buffer_value(level=-1),
+        )
+        for iteration in range(1, args.n_iter + 1):
+            optimizer.step()
+            eval_count = init_eval_count + iteration * args.batch_size
+            if iteration % args.history_interval == 0 or iteration == args.n_iter:
+                history_row = record_buffer_history(
+                    buffer.B,
+                    iteration=iteration,
+                    eval_count=eval_count,
+                )
+                history.append(history_row)
+                write_live_progress(history_row)
+                record_design_history_checkpoint(
+                    iteration=iteration,
+                    eval_count=eval_count,
+                )
+            progress.update(
+                task,
+                advance=1,
+                best=buffer.B.get_value(0, level=-1),
+                mean=buffer.B.get_mean_buffer_value(level=-1),
+            )
 
     top_k = min(9, len(buffer.B))
     top_archive_tensors = buffer.B.get_top_k(top_k)
@@ -2440,7 +6948,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     if levels_ladder_rungs:
         raw_top_values = []
         for sample in top_designs_np:
-            volume, roughness, compliance = evaluator.density_objectives(sample)
+            volume, roughness, _connectivity, compliance = evaluator.density_objectives(
+                sample
+            )
             raw_top_values.append(
                 [
                     max(volume - args.volume_max, 0.0),
@@ -2454,8 +6964,54 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     actual_compliance = top_values[:, -1].copy()
     relative_compliance = actual_compliance / evaluator.solid_compliance
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"curiosity_{args.curiosity:g}_seed_{args.seed}"
+    history_scalar_array, history_best_values, history_columns = history_arrays(history)
+    if design_history:
+        design_history_array = np.stack(design_history, axis=0).astype(np.float32)
+        design_history_values_array = np.stack(design_history_values, axis=0).astype(
+            np.float32
+        )
+        design_history_raw_code_array = np.stack(
+            design_history_raw_code,
+            axis=0,
+        ).astype(np.float32)
+    else:
+        design_history_array = np.empty(
+            (0, 0, args.grid_height, args.grid_width),
+            dtype=np.float32,
+        )
+        design_history_values_array = np.empty((0, 0, 0), dtype=np.float32)
+        design_history_raw_code_array = np.empty((0, 0, f_dim), dtype=np.float32)
+    design_history_iterations_array = np.asarray(
+        design_history_iterations,
+        dtype=np.float32,
+    )
+    design_history_eval_counts_array = np.asarray(
+        design_history_eval_counts,
+        dtype=np.float32,
+    )
+    history_plot_path = args.output_dir / f"buffer_history_{suffix}.png"
+    best_design_history_plot_path = (
+        args.output_dir / f"best_design_history_{suffix}.png"
+    )
+    if not args.no_history_plot:
+        plot_buffer_history(
+            history,
+            history_plot_path,
+            title=(
+                f"FEM Cantilever Buffer History "
+                f"({args.optimizer_type}, {args.encoding}, seed={args.seed})"
+            ),
+        )
+        save_best_design_history_grid(
+            design_history_array,
+            design_history_values_array,
+            design_history_iterations_array,
+            best_design_history_plot_path,
+            title=(
+                f"Best Design History "
+                f"({args.optimizer_type}, {args.encoding}, seed={args.seed})"
+            ),
+        )
     save_design_grid(
         top_designs,
         actual_compliance,
@@ -2467,6 +7023,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             f"FEM Cantilever Top Designs (curiosity={args.curiosity:g}, seed={args.seed})"
         ),
     )
+    mean_l2 = pairwise_l2_mean(top_designs)
+    mean_hamming = pairwise_hamming_mean(top_designs)
+
     np.savez_compressed(
         args.output_dir / f"top_designs_{suffix}.npz",
         designs=top_designs.cpu().numpy(),
@@ -2475,6 +7034,28 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         values=top_values,
         all_archive_values=summary_values,
         transformed_archive_values=transformed_archive_values,
+        history=history_scalar_array,
+        history_columns=history_columns,
+        history_best_values=history_best_values,
+        history_plot=np.asarray(
+            ["" if args.no_history_plot else str(history_plot_path)]
+        ),
+        history_interval=np.asarray([args.history_interval], dtype=np.int32),
+        live_progress=np.asarray(
+            ["" if args.no_live_progress else str(live_progress_path)]
+        ),
+        live_progress_latest=np.asarray(
+            ["" if args.no_live_progress else str(live_latest_path)]
+        ),
+        design_history=design_history_array,
+        design_history_values=design_history_values_array,
+        design_history_raw_code=design_history_raw_code_array,
+        design_history_iterations=design_history_iterations_array,
+        design_history_eval_counts=design_history_eval_counts_array,
+        design_history_top_k=np.asarray([args.design_history_top_k], dtype=np.int32),
+        best_design_history_plot=np.asarray(
+            ["" if args.no_history_plot else str(best_design_history_plot_path)]
+        ),
         actual_compliance=actual_compliance.astype(np.float32),
         relative_compliance=relative_compliance.astype(np.float32),
         archive_best_compliance=np.asarray(
@@ -2492,19 +7073,40 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         best_any_index=np.asarray([metrics["best_any_index"]], dtype=np.int32),
         feasible_count=np.asarray([metrics["feasible_count"]], dtype=np.int32),
         feasible_rate=np.asarray([metrics["feasible_rate"]], dtype=np.float32),
+        mean_l2=np.asarray([mean_l2], dtype=np.float32),
+        mean_hamming=np.asarray([mean_hamming], dtype=np.float32),
         solid_compliance=np.asarray([evaluator.solid_compliance], dtype=np.float32),
         curiosity=np.asarray([args.curiosity], dtype=np.float32),
         curiosity_space=np.asarray([args.curiosity_space]),
         curiosity_reference=np.asarray([args.curiosity_reference]),
         curiosity_schedule=np.asarray([args.curiosity_schedule]),
+        curiosity_cycles=np.asarray([args.curiosity_cycles], dtype=np.int32),
+        curiosity_decay=np.asarray(
+            ["" if args.curiosity_decay is None else args.curiosity_decay]
+        ),
         curiosity_warmup_frac=np.asarray(
             [args.curiosity_warmup_frac], dtype=np.float32
         ),
         curiosity_min=np.asarray([args.curiosity_min], dtype=np.float32),
+        plummer_power=np.asarray([args.plummer_power], dtype=np.float32),
+        plummer_eps=np.asarray([args.plummer_eps], dtype=np.float32),
+        plummer_normalize=np.asarray([args.plummer_normalize]),
+        plummer_terms=np.asarray([args.plummer_terms]),
+        g_uniformity_warmup_steps=np.asarray(
+            [args.g_uniformity_warmup_steps], dtype=np.int32
+        ),
+        g_uniformity_warmup_batch_size=np.asarray([warmup_batch_size], dtype=np.int32),
+        g_uniformity_warmup_weight=np.asarray([warmup_weight], dtype=np.float32),
+        g_uniformity_warmup_t=np.asarray(
+            [args.g_uniformity_warmup_t], dtype=np.float32
+        ),
         seed=np.asarray([args.seed], dtype=np.int32),
         preset=np.asarray([args.preset]),
         grid_width=np.asarray([args.grid_width], dtype=np.int32),
         grid_height=np.asarray([args.grid_height], dtype=np.int32),
+        latent_distribution=np.asarray([args.latent_distribution]),
+        latent_uniform_low=np.asarray([args.latent_uniform_low], dtype=np.float32),
+        latent_uniform_high=np.asarray([args.latent_uniform_high], dtype=np.float32),
         domain_width=np.asarray([args.domain_width], dtype=np.float32),
         domain_height=np.asarray([args.domain_height], dtype=np.float32),
         coarse_grid_width=np.asarray([code_width], dtype=np.int32),
@@ -2524,11 +7126,81 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         tiny_decoder_latent_scale=np.asarray(
             [args.tiny_decoder_latent_scale], dtype=np.float32
         ),
+        sorted_material_profile=np.asarray([args.sorted_material_profile]),
+        sorted_material_steepness=np.asarray(
+            [args.sorted_material_steepness], dtype=np.float32
+        ),
+        bar_count=np.asarray([args.bar_count], dtype=np.int32),
+        bar_width_min=np.asarray([args.bar_width_min], dtype=np.float32),
+        bar_width_max=np.asarray([args.bar_width_max], dtype=np.float32),
+        bar_edge_softness=np.asarray([args.bar_edge_softness], dtype=np.float32),
         generator_type=np.asarray([args.generator_type]),
+        generator_output_norm=np.asarray([args.generator_output_norm]),
         discriminator_type=np.asarray([args.discriminator_type]),
+        discriminator_spectral_norm=np.asarray([args.discriminator_spectral_norm]),
+        discriminator_activation=np.asarray([args.discriminator_activation]),
+        fixed_latent_bank=np.asarray([args.fixed_latent_bank]),
+        fixed_latent_bank_size=np.asarray([fixed_latent_bank_size], dtype=np.int32),
+        fixed_latent_selection=np.asarray([args.fixed_latent_selection]),
+        fixed_latent_candidate_multiplier=np.asarray(
+            [args.fixed_latent_candidate_multiplier], dtype=np.int32
+        ),
+        fixed_latent_sample_mode=np.asarray([args.fixed_latent_sample_mode]),
+        fixed_latent_noise_std=np.asarray(
+            [args.fixed_latent_noise_std], dtype=np.float32
+        ),
+        fixed_latent_noise_normalize=np.asarray(
+            [not args.fixed_latent_noise_no_normalize], dtype=np.int32
+        ),
+        fixed_latent_uniformity_active=np.asarray([fixed_latent_uniformity_active]),
+        fixed_latent_uniformity_weight=np.asarray(
+            [args.fixed_latent_uniformity_weight], dtype=np.float32
+        ),
+        fixed_latent_uniformity_batch_size=np.asarray(
+            [args.fixed_latent_uniformity_batch_size], dtype=np.int32
+        ),
+        fixed_latent_uniformity_t=np.asarray(
+            [args.fixed_latent_uniformity_t], dtype=np.float32
+        ),
+        fixed_latent_uniformity_sample_mode=np.asarray(
+            [args.fixed_latent_uniformity_sample_mode]
+        ),
         generator_channels=np.asarray([args.generator_channels], dtype=np.int32),
+        set_generator_dim=np.asarray([args.set_generator_dim], dtype=np.int32),
+        set_generator_depth=np.asarray([args.set_generator_depth], dtype=np.int32),
+        set_generator_heads=np.asarray([args.set_generator_heads], dtype=np.int32),
+        set_generator_mlp_ratio=np.asarray(
+            [args.set_generator_mlp_ratio], dtype=np.int32
+        ),
+        set_generator_dropout=np.asarray(
+            [args.set_generator_dropout], dtype=np.float32
+        ),
+        set_generator_elite_context_size=np.asarray(
+            [args.set_generator_elite_context_size], dtype=np.int32
+        ),
+        set_generator_elite_context_pool_size=np.asarray(
+            [
+                -1
+                if args.set_generator_elite_context_pool_size is None
+                else args.set_generator_elite_context_pool_size
+            ],
+            dtype=np.int32,
+        ),
         discriminator_channels=np.asarray(
             [args.discriminator_channels], dtype=np.int32
+        ),
+        set_discriminator_dim=np.asarray([args.set_discriminator_dim], dtype=np.int32),
+        set_discriminator_depth=np.asarray(
+            [args.set_discriminator_depth], dtype=np.int32
+        ),
+        set_discriminator_heads=np.asarray(
+            [args.set_discriminator_heads], dtype=np.int32
+        ),
+        set_discriminator_mlp_ratio=np.asarray(
+            [args.set_discriminator_mlp_ratio], dtype=np.int32
+        ),
+        set_discriminator_dropout=np.asarray(
+            [args.set_discriminator_dropout], dtype=np.float32
         ),
         train_on_decoded=np.asarray([args.train_on_decoded], dtype=np.int32),
         optimizer_type=np.asarray([args.optimizer_type]),
@@ -2551,6 +7223,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         ranker_target_curve=np.asarray([args.ranker_target_curve]),
         ranker_tau=np.asarray([args.ranker_tau], dtype=np.float32),
         ranker_target_scope=np.asarray([args.ranker_target_scope]),
+        ranker_list_repeats=np.asarray([args.ranker_list_repeats], dtype=np.int32),
+        ranker_fake_weight=np.asarray([args.ranker_fake_weight], dtype=np.float32),
+        ranker_fake_repeats=np.asarray([args.ranker_fake_repeats], dtype=np.int32),
         ranker_sample_pool_size=np.asarray(
             [
                 -1
@@ -2560,13 +7235,120 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             dtype=np.int32,
         ),
         ranker_sample_mode=np.asarray([args.ranker_sample_mode]),
+        d_score_center_weight=np.asarray(
+            [args.d_score_center_weight], dtype=np.float32
+        ),
+        d_score_scale_weight=np.asarray([args.d_score_scale_weight], dtype=np.float32),
+        d_score_target_std=np.asarray([args.d_score_target_std], dtype=np.float32),
+        utility_target_scale=np.asarray([args.utility_target_scale], dtype=np.float32),
+        utility_loss=np.asarray([args.utility_loss]),
+        utility_weight=np.asarray([args.utility_weight], dtype=np.float32),
+        generator_utility_weight=np.asarray(
+            [args.generator_utility_weight], dtype=np.float32
+        ),
+        utility_clip=np.asarray([args.utility_clip], dtype=np.float32),
+        proposal_pool_size=np.asarray(
+            [-1 if args.proposal_pool_size is None else args.proposal_pool_size],
+            dtype=np.int32,
+        ),
+        proposal_top_k=np.asarray(
+            [-1 if args.proposal_top_k is None else args.proposal_top_k],
+            dtype=np.int32,
+        ),
+        proposal_diversity_min_hamming=np.asarray(
+            [args.proposal_diversity_min_hamming], dtype=np.float32
+        ),
+        proposal_diversity_topk_frac=np.asarray(
+            [args.proposal_diversity_topk_frac], dtype=np.float32
+        ),
+        proposal_buffer_novelty_min_hamming=np.asarray(
+            [args.proposal_buffer_novelty_min_hamming], dtype=np.float32
+        ),
+        proposal_buffer_novelty_reference_size=np.asarray(
+            [args.proposal_buffer_novelty_reference_size], dtype=np.int32
+        ),
+        proposal_buffer_reject_exact_design_duplicates=np.asarray(
+            [args.proposal_buffer_reject_exact_design_duplicates], dtype=np.int32
+        ),
+        proposal_buffer_novelty_threshold=np.asarray(
+            [args.proposal_buffer_novelty_threshold], dtype=np.float32
+        ),
+        proposal_evolution_fraction=np.asarray(
+            [args.proposal_evolution_fraction], dtype=np.float32
+        ),
+        proposal_evolution_parent_source=np.asarray(
+            [args.proposal_evolution_parent_source]
+        ),
+        proposal_evolution_crossover=np.asarray([args.proposal_evolution_crossover]),
+        proposal_evolution_mutation_rate=np.asarray(
+            [args.proposal_evolution_mutation_rate], dtype=np.float32
+        ),
+        proposal_evolution_mutation_scale=np.asarray(
+            [args.proposal_evolution_mutation_scale], dtype=np.float32
+        ),
+        proposal_gradient_steps=np.asarray(
+            [args.proposal_gradient_steps], dtype=np.int32
+        ),
+        proposal_gradient_step_size=np.asarray(
+            [args.proposal_gradient_step_size], dtype=np.float32
+        ),
+        proposal_gradient_mode=np.asarray([args.proposal_gradient_mode]),
+        proposal_gradient_normalize=np.asarray(
+            [not args.proposal_gradient_no_normalize], dtype=np.int32
+        ),
+        proposal_gradient_noise=np.asarray(
+            [args.proposal_gradient_noise], dtype=np.float32
+        ),
+        proposal_gradient_keep_original=np.asarray(
+            [args.proposal_gradient_keep_original], dtype=np.int32
+        ),
+        ga_offspring_fraction=np.asarray(
+            [args.ga_offspring_fraction], dtype=np.float32
+        ),
+        ga_pool_size=np.asarray(
+            [-1 if args.ga_pool_size is None else args.ga_pool_size],
+            dtype=np.int32,
+        ),
+        ga_parent_pool_size=np.asarray([args.ga_parent_pool_size], dtype=np.int32),
+        ga_mutation_rate=np.asarray([args.ga_mutation_rate], dtype=np.float32),
+        ga_mutation_scale=np.asarray([args.ga_mutation_scale], dtype=np.float32),
         buffer_multiplier=np.asarray([args.buffer_multiplier], dtype=np.int32),
+        buffer_diversity_min_hamming=np.asarray(
+            [args.buffer_diversity_min_hamming], dtype=np.float32
+        ),
+        buffer_diversity_topk_frac=np.asarray(
+            [args.buffer_diversity_topk_frac], dtype=np.float32
+        ),
         density_filter_radius=np.asarray([args.density_filter_radius], dtype=np.int32),
         projection_beta=np.asarray([args.projection_beta], dtype=np.float32),
         projection_eta=np.asarray([args.projection_eta], dtype=np.float32),
+        binhead_connect_support=np.asarray(
+            [args.binhead_connect_support], dtype=np.int32
+        ),
         volume_ladder=np.asarray(args.volume_ladder, dtype=np.float32),
         compliance_ladder=np.asarray(args.compliance_ladder, dtype=np.float32),
         roughness_ladder=np.asarray(args.roughness_ladder, dtype=np.float32),
+        connectivity_ladder=np.asarray(args.connectivity_ladder, dtype=np.float32),
+        removal_ladder_volumes=np.asarray(
+            args.removal_ladder_volumes,
+            dtype=np.float32,
+        ),
+        removal_ladder_compliances=np.asarray(
+            args.removal_ladder_compliances,
+            dtype=np.float32,
+        ),
+        removal_ladder_connectivity_max=np.asarray(
+            [
+                float("nan")
+                if args.removal_ladder_connectivity_max is None
+                else args.removal_ladder_connectivity_max
+            ],
+            dtype=np.float32,
+        ),
+        connectivity_max=np.asarray(
+            [float("nan") if args.connectivity_max is None else args.connectivity_max],
+            dtype=np.float32,
+        ),
         ladder_sequence=np.asarray(
             [f"{kind}:{bound:g}" for kind, bound in ladder_sequence]
         ),
@@ -2577,6 +7359,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         levels_ladder_final_open=np.asarray([args.levels_ladder_final_open]),
         residual_scale=np.asarray([args.residual_scale], dtype=np.float32),
         load_case=np.asarray([args.load_case]),
+        robust_load_cases=np.asarray(args.robust_load_cases),
+        robust_load_aggregate=np.asarray([args.robust_load_aggregate]),
+        robust_load_cvar_frac=np.asarray(
+            [args.robust_load_cvar_frac],
+            dtype=np.float32,
+        ),
         load_scale=np.asarray([args.load_scale], dtype=np.float32),
         fem_workers=np.asarray([args.fem_workers], dtype=np.int32),
         e_max=np.asarray([args.e_max], dtype=np.float32),
@@ -2611,12 +7399,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "best_relative_compliance": float(relative_compliance[0]),
         "mean_relative_compliance_topk": float(relative_compliance.mean()),
         "solid_compliance": float(evaluator.solid_compliance),
-        "mean_l2": pairwise_l2_mean(top_designs),
-        "mean_hamming": pairwise_hamming_mean(top_designs),
+        "mean_l2": mean_l2,
+        "mean_hamming": mean_hamming,
         "curiosity": args.curiosity,
+        "curiosity_space": args.curiosity_space,
         "seed": args.seed,
         "output_dir": str(args.output_dir),
         "artifact_path": str(args.output_dir / f"top_designs_{suffix}.npz"),
+        "history_plot": "" if args.no_history_plot else str(history_plot_path),
     }
 
 
