@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use pyo3::PyResult;
+use std::cmp::Ordering;
 
 #[pymodule]
 fn buffer_core(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -14,6 +15,44 @@ pub struct BufferCore {
     sorted_indices: Vec<usize>,
     max_size: usize,
     value_levels: usize,
+}
+
+impl BufferCore {
+    fn cmp_f32(a: f32, b: f32) -> Ordering {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => a.total_cmp(&b),
+        }
+    }
+
+    fn cmp_value_vec(a: &[f32], b: &[f32]) -> Ordering {
+        for (av, bv) in a.iter().zip(b.iter()) {
+            let ord = Self::cmp_f32(*av, *bv);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        a.len().cmp(&b.len())
+    }
+
+    fn sorted_insert_position(&self, idx: usize) -> usize {
+        self.sorted_indices
+            .binary_search_by(|&probe| Self::cmp_value_vec(&self.values[probe], &self.values[idx]))
+            .unwrap_or_else(|pos| pos)
+    }
+
+    fn insert_sorted_index(&mut self, idx: usize) {
+        let pos = self.sorted_insert_position(idx);
+        self.sorted_indices.insert(pos, idx);
+    }
+
+    fn remove_sorted_index(&mut self, idx: usize) {
+        if let Some(pos) = self.sorted_indices.iter().position(|&value| value == idx) {
+            self.sorted_indices.remove(pos);
+        }
+    }
 }
 
 #[pymethods]
@@ -38,25 +77,22 @@ impl BufferCore {
 
         if self.values.len() == self.max_size {
             let worst_idx = *self.sorted_indices.last().unwrap();
-            // NOTE: vec implements PratialOrder, so we can compare vectors
-            if value >= self.values[worst_idx] {
+            if Self::cmp_value_vec(&value, &self.values[worst_idx]) != Ordering::Less {
                 return None;
             }
-            // Replace worst value at its position (no removal/shifting)
             self.values[worst_idx] = value;
-            self.update_sorted_indices();
+            self.remove_sorted_index(worst_idx);
+            self.insert_sorted_index(worst_idx);
             return Some(worst_idx);
         }
 
-        // Buffer is still growing, add to next position
         let position = self.values.len();
         self.values.push(value);
-        self.update_sorted_indices();
+        self.insert_sorted_index(position);
         Some(position)
     }
 
     pub fn insert_many(&mut self, values: Vec<Vec<f32>>) {
-        // NOTE: for now this is ok but lets check later if theres a better way
         for value in values {
             self.insert(value);
         }
@@ -99,11 +135,5 @@ impl BufferCore {
             .iter()
             .map(|&i| self.values[i].clone())
             .collect()
-    }
-
-    fn update_sorted_indices(&mut self) {
-        let mut idx: Vec<_> = (0..self.values.len()).collect();
-        idx.sort_by(|&a, &b| self.values[a].partial_cmp(&self.values[b]).unwrap());
-        self.sorted_indices = idx;
     }
 }

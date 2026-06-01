@@ -1,13 +1,17 @@
 from dataclasses import dataclass
+import warnings
+
 import torch
 from torch import nn
-from ..buffer import Buffer
-from ..utils import cross_similarity_loss
-from ..utils import self_similarity_loss
-from ..utils import cross_siglip
-from ..utils import self_siglip
-from ..utils import uniformity_loss
 
+from ..buffer import Buffer
+from ..utils import (
+    cross_siglip,
+    cross_similarity_loss,
+    self_siglip,
+    self_similarity_loss,
+    uniformity_loss,
+)
 from .scheduler import Scheduler
 
 
@@ -29,22 +33,27 @@ class CuriosityLossBase(nn.Module):
         self.buffer = buffer
         self.scheduler = scheduler
 
+    def _buffer_top_k_like(self, x: torch.Tensor, k: int) -> torch.Tensor:
+        if self.buffer is None:
+            raise ValueError("Buffer-dependent curiosity loss requires a buffer")
+        k = min(k, len(self.buffer))
+        return self.buffer.get_top_k(k).to(device=x.device, dtype=x.dtype)
+
 
 @dataclass
 class CuriosityLossConfig(CuriosityLossBaseConfig):
     temperature: float = 0.7
-
-    # NOTE: a value <= 0 deactivates the loss
+    # Values <= 0 explicitly disable the corresponding term.
     calc_self_sim: float = 0.5
     calc_cross_sim: float = 0.5
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.calc_cross_sim = self.calc_cross_sim if self.calc_cross_sim > 0.0 else 0.0
         self.calc_self_sim = self.calc_self_sim if self.calc_self_sim > 0.0 else 0.0
 
 
 class CuriosityLoss(CuriosityLossBase):
-    """Loss is based on CLIP loss"""
+    """Repulsion-style curiosity loss based on cosine similarity logits."""
 
     def __init__(
         self,
@@ -55,24 +64,29 @@ class CuriosityLoss(CuriosityLossBase):
     ) -> None:
         super().__init__(config, buffer, scheduler)
         self.config = config
-        if self.config.calc_cross_sim and not buffer:
+        warnings.warn(
+            "CuriosityLoss is a legacy curiosity objective. Prefer WangIsolaUniformity for new code.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if self.config.calc_cross_sim and buffer is None:
             raise ValueError(
-                "Cross similarity loss is configured to be calculated, but buffer is not passed. Cross similarity is calculated between generator output and top K samples from the buffer"
+                "Cross similarity loss requires a buffer because it compares generator outputs against elite buffer samples"
             )
-        self.buffer: Buffer | None = buffer
 
-    def forward(self, G_out: torch.Tensor) -> torch.Tensor:
-        bs = G_out.size(0)
-        loss = 0
+    def forward(self, g_out: torch.Tensor) -> torch.Tensor:
+        batch_size = g_out.size(0)
+        loss = torch.zeros((), device=g_out.device, dtype=g_out.dtype)
         sched_value = self.scheduler.step() if self.scheduler else 1.0
-        if self.config.calc_cross_sim and self.buffer:
+        if self.config.calc_cross_sim and self.buffer is not None:
+            elite = self._buffer_top_k_like(g_out, batch_size)
             loss = (
                 loss
                 + sched_value
                 * self.config.calc_cross_sim
                 * cross_similarity_loss(
-                    G_out,
-                    self.buffer.get_top_k(bs),
+                    g_out,
+                    elite,
                     temperature=self.config.temperature,
                 )
             )
@@ -82,7 +96,7 @@ class CuriosityLoss(CuriosityLossBase):
                 loss
                 + sched_value
                 * self.config.calc_self_sim
-                * self_similarity_loss(G_out, temperature=self.config.temperature)
+                * self_similarity_loss(g_out, temperature=self.config.temperature)
             )
         return loss
 
@@ -93,20 +107,35 @@ class CuriositySiglipLossConfig(CuriosityLossConfig):
 
 
 class CuriositySiglipLoss(CuriosityLoss):
-    """Loss is based on Siglip loss"""
+    """Repulsion-style curiosity loss using SigLIP-style negative pairs only."""
 
-    def forward(self, G_out: torch.Tensor) -> torch.Tensor:
-        bs = G_out.size(0)
-        loss = 0
+    def __init__(
+        self,
+        config: CuriositySiglipLossConfig,
+        buffer: Buffer | None = None,
+        scheduler: Scheduler | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(config, buffer, scheduler, **kwargs)
+        warnings.warn(
+            "CuriositySiglipLoss is a legacy curiosity objective. Prefer WangIsolaUniformity for new code.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    def forward(self, g_out: torch.Tensor) -> torch.Tensor:
+        batch_size = g_out.size(0)
+        loss = torch.zeros((), device=g_out.device, dtype=g_out.dtype)
         sched_value = self.scheduler.step() if self.scheduler else 1.0
-        if self.config.calc_cross_sim and self.buffer:
+        if self.config.calc_cross_sim and self.buffer is not None:
+            elite = self._buffer_top_k_like(g_out, batch_size)
             loss = loss + sched_value * self.config.calc_cross_sim * cross_siglip(
-                G_out, self.buffer.get_top_k(bs), temperature=self.config.temperature
+                g_out, elite, temperature=self.config.temperature
             )
 
         if self.config.calc_self_sim:
             loss = loss + sched_value * self.config.calc_self_sim * self_siglip(
-                G_out, temperature=self.config.temperature
+                g_out, temperature=self.config.temperature
             )
         return loss
 
@@ -119,11 +148,7 @@ class WangIsolaUniformityConfig(CuriosityLossBaseConfig):
 
 
 class WangIsolaUniformity(CuriosityLossBase):
-    """Dedicated Wang–Isola uniformity curiosity loss.
-
-    Computes log E[exp(-t * ||xi - xj||^2)] on L2‑normalized embeddings. Optionally
-    augments the batch with top‑K items from the buffer.
-    """
+    """Dedicated Wang–Isola uniformity curiosity loss."""
 
     def __init__(
         self,
@@ -135,13 +160,12 @@ class WangIsolaUniformity(CuriosityLossBase):
         super().__init__(config, buffer, scheduler)
         self.config = config
 
-    def forward(self, G_out: torch.Tensor) -> torch.Tensor:
-        bs = G_out.size(0)
+    def forward(self, g_out: torch.Tensor) -> torch.Tensor:
+        batch_size = g_out.size(0)
         sched_value = self.scheduler.step() if self.scheduler else 1.0
         if self.config.use_buffer:
-            if not self.buffer:
-                raise ValueError("use_buffer=True but no buffer provided")
-            x = torch.cat([G_out, self.buffer.get_top_k(bs)], dim=0)
+            elite = self._buffer_top_k_like(g_out, batch_size)
+            x = torch.cat([g_out, elite], dim=0)
         else:
-            x = G_out
+            x = g_out
         return sched_value * self.config.weight * uniformity_loss(x, t=self.config.t)

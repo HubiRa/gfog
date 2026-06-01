@@ -1,11 +1,12 @@
-import torch
+import math
+import warnings
+from abc import ABC, abstractmethod
 from typing import Iterable, TypedDict
 
+import torch
 from loguru import logger
-from abc import ABC, abstractmethod
-from rich.progress import track
+from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn, track
 
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn
 from ..components import OptComponents
 
 
@@ -17,18 +18,17 @@ class PrintTableOptions(TypedDict):
 class BaseOpt(ABC):
     def __init__(self, components: OptComponents) -> None:
         self.components = components
-        # convenience:
         self.fn = self.components.fn
         self.gan = self.components.gan
         self.buffer = self.components.buffer
         self.init_buffer()
 
     def init_buffer(self) -> None:
-        n_iter = self.buffer.B.buffer_size // self.components.batch_size
+        n_iter = math.ceil(self.buffer.B.buffer_size / self.components.batch_size)
         logger.info(
-            f"Filling buffer of size {self.buffer.B.buffer_size} with {n_iter + 1} iterations"
+            f"Filling buffer of size {self.buffer.B.buffer_size} with {n_iter} iterations"
         )
-        for _ in track(range(n_iter + 1), description="Filling buffer: "):
+        for _ in track(range(n_iter), description="Filling buffer: "):
             if self.gan.G is not None:
                 x = self.gan.latent_sampler().to(self.gan.device, self.gan.dtype)
                 with torch.no_grad():
@@ -56,22 +56,36 @@ class BaseOpt(ABC):
         self,
         n_iter: int,
         termination_eps: float | None = None,
-        verbous: bool = False,
+        verbose: bool = False,
         print_table_options: PrintTableOptions | None = None,
+        **kwargs,
     ) -> torch.Tensor:
+        if "verbous" in kwargs:
+            warnings.warn(
+                "'verbous' is deprecated; use 'verbose' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            verbose = kwargs.pop("verbous")
+        if kwargs:
+            raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs.keys())}")
+
         def take_step() -> bool:
             self.step()
             if termination_eps is not None:
                 if (
-                    abs(self.buffer.B.values[0] - self.buffer.B.get_mean_buffer_value())
+                    abs(
+                        self.buffer.B.get_value(0, level=-1)
+                        - self.buffer.B.get_mean_buffer_value(level=-1)
+                    )
                     < termination_eps
                 ):
-                    return True  # stop
-            return False  # do not stop
+                    return True
+            return False
 
-        if not verbous:
+        if not verbose:
             for _ in range(n_iter):
-                if stop := take_step():
+                if take_step():
                     break
         else:
             progress = Progress(
@@ -85,8 +99,14 @@ class BaseOpt(ABC):
                 task = progress.add_task(
                     "Optimizing", total=n_iter, best=999.0, mean=999.0
                 )
+                print_every_n_steps = 0
+                if print_table_options is not None:
+                    print_every_n_steps = print_table_options.get(
+                        "print_table_every_n_steps", 0
+                    )
+
                 for i in range(n_iter):
-                    if stop := take_step():
+                    if take_step():
                         break
                     progress.update(
                         task,
@@ -95,9 +115,12 @@ class BaseOpt(ABC):
                         mean=self.buffer.B.get_mean_buffer_value(level=-1),
                     )
 
-                    if print_table_options and (
-                        n := print_table_options.get("print_table_every_n_steps", 0) > 0
-                    ):
-                        if i % n == 0:
-                            k = print_table_options.get("k_best", 3)
-                            self.buffer.B.print_values(slice(0, k, 1))
+                    if print_every_n_steps > 0 and i % print_every_n_steps == 0:
+                        k = (
+                            print_table_options.get("k_best", 3)
+                            if print_table_options
+                            else 3
+                        )
+                        self.buffer.B.print_values(slice(0, k, 1))
+
+        return self.buffer.B.get_top_k(1)

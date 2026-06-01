@@ -1,23 +1,23 @@
 import torch
+import torch.nn.functional as F
 
 from .common import GANOptMixin
 
 
-class DefaultOpt(GANOptMixin):
+class HingeGANOpt(GANOptMixin):
     def _train_discriminator_step(self) -> None:
         self.gan.optimizerD.zero_grad()
 
         elite = self._select_elite_batch()
-        out_buffer = self.gan.D(elite)
-        loss_buffer = self.gan.loss(out_buffer, torch.ones_like(out_buffer))
+        out_real = self.gan.D(elite)
 
         with torch.no_grad():
-            gen_samples = self._sample_generator_output()
+            fake = self._sample_generator_output()
+        out_fake = self.gan.D(fake.detach())
 
-        out_model = self.gan.D(gen_samples.detach())
-        loss_model = self.gan.loss(out_model, torch.zeros_like(out_model))
-
-        loss = loss_buffer + loss_model
+        loss_real = F.relu(1.0 - out_real).mean()
+        loss_fake = F.relu(1.0 + out_fake).mean()
+        loss = loss_real + loss_fake
         loss.backward()
         self.gan.optimizerD.step()
 
@@ -28,13 +28,9 @@ class DefaultOpt(GANOptMixin):
             self._train_discriminator_step()
 
         x = self._sample_generator_output()
-
         loss_curiosity = self._curiosity_loss(x)
-
-        out_g = self.gan.D(x)
-        loss_g = self.gan.loss(out_g, torch.ones_like(out_g))
+        loss_g = -self.gan.D(x).mean()
         loss = loss_g + loss_curiosity
         loss.backward()
         self.gan.optimizerG.step()
-
         return x

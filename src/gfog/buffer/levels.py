@@ -224,10 +224,13 @@ class Levels:
         n_levels = self.num_levels()
 
         # Scalar
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) or (
+            hasattr(value, "dim") and callable(value.dim) and value.dim() == 0
+        ):
+            scalar_value = float(value)
             if self.has_transform():
                 if (self.num_objectives or 0) == 1:
-                    return self.transform([float(value)])
+                    return self.transform([scalar_value])
                 raise ValueError(
                     "Scalar provided but ladder expects multiple objectives"
                 )
@@ -235,7 +238,7 @@ class Levels:
                 raise ValueError(
                     f"Single value provided but buffer has {n_levels} levels"
                 )
-            return [float(value)]
+            return [scalar_value]
 
         # Sequence
         seq = list(value)

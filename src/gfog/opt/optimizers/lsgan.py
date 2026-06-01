@@ -3,21 +3,20 @@ import torch
 from .common import GANOptMixin
 
 
-class DefaultOpt(GANOptMixin):
+class LSGANOpt(GANOptMixin):
     def _train_discriminator_step(self) -> None:
         self.gan.optimizerD.zero_grad()
 
         elite = self._select_elite_batch()
-        out_buffer = self.gan.D(elite)
-        loss_buffer = self.gan.loss(out_buffer, torch.ones_like(out_buffer))
+        out_real = self.gan.D(elite)
+        loss_real = 0.5 * ((out_real - 1.0) ** 2).mean()
 
         with torch.no_grad():
-            gen_samples = self._sample_generator_output()
+            fake = self._sample_generator_output()
+        out_fake = self.gan.D(fake.detach())
+        loss_fake = 0.5 * (out_fake**2).mean()
 
-        out_model = self.gan.D(gen_samples.detach())
-        loss_model = self.gan.loss(out_model, torch.zeros_like(out_model))
-
-        loss = loss_buffer + loss_model
+        loss = loss_real + loss_fake
         loss.backward()
         self.gan.optimizerD.step()
 
@@ -28,13 +27,9 @@ class DefaultOpt(GANOptMixin):
             self._train_discriminator_step()
 
         x = self._sample_generator_output()
-
         loss_curiosity = self._curiosity_loss(x)
-
-        out_g = self.gan.D(x)
-        loss_g = self.gan.loss(out_g, torch.ones_like(out_g))
+        loss_g = 0.5 * ((self.gan.D(x) - 1.0) ** 2).mean()
         loss = loss_g + loss_curiosity
         loss.backward()
         self.gan.optimizerG.step()
-
         return x
