@@ -175,8 +175,12 @@ poetry.toml
 **/data/
 .DS_Store
 **/wandb/
+results/
 *.zip
 *.gif
+*.mp4
+*.ORIG
+examples/gymnasium/1
 assets/*
 !assets/.gitkeep
 !assets/example.gif

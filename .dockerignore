@@ -1,0 +1,20 @@
+# Don't copy build artifacts, venvs, caches into Docker
+.venv/
+__pycache__/
+*.pyc
+.git/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Rust build artifacts (will be rebuilt in container)
+**/target/
+
+# Results and data
+results/
+**/data/
+**/wandb/
+
+# OS files
+.DS_Store
+*.gif
