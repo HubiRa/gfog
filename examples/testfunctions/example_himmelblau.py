@@ -75,7 +75,15 @@ gan = components.GAN(
 # -------------------------------
 
 optimizer = DefaultOpt(
-    components.OptComponents(fn=fn, gan=gan, batch_size=BATCH_SIZE, buffer=buffer)
+    components.OptComponents(
+        fn=fn,
+        gan=gan,
+        batch_size=BATCH_SIZE,
+        buffer=buffer,
+        discriminator_steps=1,
+        elite_sampling="random_top_k",
+        elite_pool_size=2 * BATCH_SIZE,
+    )
 )
 
 progress = Progress(
@@ -95,7 +103,7 @@ def main() -> None:
     iteration_numbers = []
     best_values = []
 
-    logger.info("Staring optimization")
+    logger.info("Starting optimization")
     with progress:
         task = progress.add_task("Optimizing", total=N_ITER, best=999.0, mean=999.0)
         for i in range(N_ITER):

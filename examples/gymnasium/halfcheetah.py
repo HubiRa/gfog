@@ -29,28 +29,41 @@ def get_optimizer_cls(name: str):
         ) from exc
 
 
-class CartPoleEvaluator:
-    """Evaluate a linear CartPole policy with repeated seeded rollouts."""
+class LinearContinuousPolicyEvaluator:
+    """Evaluate a linear tanh policy on a continuous-control environment."""
 
     def __init__(
-        self, episode_steps: int, runs_per_env: int = 5, seed: int = 0
+        self,
+        env_id: str,
+        obs_dim: int,
+        action_dim: int,
+        episode_steps: int,
+        runs_per_env: int = 1,
+        seed: int = 0,
     ) -> None:
+        self.env_id = env_id
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
         self.episode_steps = episode_steps
         self.runs_per_env = runs_per_env
         self.seed = seed
 
-    def _run_env(self, theta: np.ndarray, rollout_seed: int) -> float:
-        env = gym.make("CartPole-v1", max_episode_steps=self.episode_steps)
+    def _rollout(self, theta: np.ndarray, rollout_seed: int) -> float:
+        env = gym.make(self.env_id, max_episode_steps=self.episode_steps)
         try:
+            weight_size = self.obs_dim * self.action_dim
+            w = theta[:weight_size].reshape(self.obs_dim, self.action_dim)
+            b = theta[weight_size : weight_size + self.action_dim]
+
             obs, _ = env.reset(seed=rollout_seed)
-            total = 0.0
+            total_reward = 0.0
             done = False
             while not done:
-                act = 0 if (obs @ theta[:4] + theta[4]) < 0 else 1
-                obs, reward, terminated, truncated, _ = env.step(act)
+                action = np.tanh(obs @ w + b)
+                obs, reward, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
-                total += reward
-            return float(total)
+                total_reward += reward
+            return float(total_reward)
         finally:
             env.close()
 
@@ -61,7 +74,7 @@ class CartPoleEvaluator:
         returns = []
         for i, candidate in enumerate(theta):
             runs = [
-                self._run_env(candidate, self.seed + 10_000 * i + j)
+                self._rollout(candidate, self.seed + 10_000 * i + j)
                 for j in range(self.runs_per_env)
             ]
             returns.append(-float(np.median(runs)))
@@ -69,70 +82,34 @@ class CartPoleEvaluator:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="GFog CartPole example")
+    parser = argparse.ArgumentParser(description="GFog HalfCheetah example")
     parser.add_argument(
         "--optimizer",
         type=str,
         default="wgangp",
         choices=["default", "hinge", "wgan", "wgangp"],
-        help="Optimizer variant. WGANGP is a good default for noisy RL returns.",
+        help="Optimizer variant. WGANGP is the recommended default for this harder RL example.",
     )
+    parser.add_argument("--env_id", type=str, default="HalfCheetah-v5")
     parser.add_argument(
-        "--n_iter", type=int, default=200, help="Optimization iterations"
+        "--n_iter", type=int, default=100, help="Optimization iterations"
     )
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument("--latent_dim", type=int, default=10, help="Latent dimension")
-    parser.add_argument(
-        "--runs_per_env",
-        type=int,
-        default=5,
-        help="Episodes evaluated per candidate policy",
-    )
-    parser.add_argument(
-        "--episode_steps",
-        type=int,
-        default=500,
-        help="CartPole max steps during training evaluation",
-    )
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--latent_dim", type=int, default=32, help="Latent dimension")
+    parser.add_argument("--episode_steps", type=int, default=500)
+    parser.add_argument("--runs_per_env", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--curiosity", type=float, default=2.0)
+    parser.add_argument("--g_lr", type=float, default=0.005)
+    parser.add_argument("--d_lr", type=float, default=0.01)
+    parser.add_argument("--discriminator_steps", type=int, default=3)
+    parser.add_argument("--gradient_penalty_weight", type=float, default=10.0)
+    parser.add_argument("--weight_clip", type=float, default=0.01)
     parser.add_argument(
         "--generalization_steps",
         type=int,
-        default=5000,
+        default=1000,
         help="Episode length used for the final generalization check",
-    )
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument(
-        "--curiosity",
-        type=float,
-        default=5.0,
-        help="Uniformity curiosity weight (0 to disable)",
-    )
-    parser.add_argument(
-        "--g_lr", type=float, default=0.01, help="Generator learning rate"
-    )
-    parser.add_argument(
-        "--d_lr",
-        type=float,
-        default=0.03,
-        help="Discriminator/critic learning rate",
-    )
-    parser.add_argument(
-        "--discriminator_steps",
-        type=int,
-        default=3,
-        help="Discriminator/critic updates per generator update",
-    )
-    parser.add_argument(
-        "--gradient_penalty_weight",
-        type=float,
-        default=10.0,
-        help="Gradient penalty weight for WGANGPOpt",
-    )
-    parser.add_argument(
-        "--weight_clip",
-        type=float,
-        default=0.01,
-        help="Weight clipping value for WGANOpt",
     )
     return parser
 
@@ -143,11 +120,21 @@ def run_experiment(
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    f_dim = 5
+    probe_env = gym.make(args.env_id, max_episode_steps=args.episode_steps)
+    try:
+        obs_dim = int(np.prod(probe_env.observation_space.shape))
+        action_dim = int(np.prod(probe_env.action_space.shape))
+    finally:
+        probe_env.close()
+
+    f_dim = obs_dim * action_dim + action_dim
     device = torch.device("cpu")
 
     fn = components.Fn(
-        f=CartPoleEvaluator(
+        f=LinearContinuousPolicyEvaluator(
+            args.env_id,
+            obs_dim=obs_dim,
+            action_dim=action_dim,
             episode_steps=args.episode_steps,
             runs_per_env=args.runs_per_env,
             seed=args.seed,
@@ -160,20 +147,19 @@ def run_experiment(
     g = MLP(
         input_dim=args.latent_dim,
         output_dim=f_dim,
-        hidden_dims=[32],
+        hidden_dims=[128, 64],
         output_activation=torch.nn.Tanh(),
     ).to(device)
     d = MLP(
         input_dim=f_dim,
         output_dim=1,
-        hidden_dims=[32],
+        hidden_dims=[128, 64],
         use_spectral_norm=args.optimizer in {"default", "hinge"},
     ).to(device)
 
     buffer = components.BufferComp(
         B=Buffer(
-            buffer_size=2 * args.batch_size,
-            value_levels=Levels(["median return"]),
+            buffer_size=2 * args.batch_size, value_levels=Levels(["median return"])
         )
     )
 
@@ -190,10 +176,10 @@ def run_experiment(
         loss=BCEWithLogitsLoss(),
         curiosity_loss=curiosity_loss,
         latent_dim=args.latent_dim,
-        optimizerG=torch.optim.Adam(lr=args.g_lr, params=g.parameters()),
-        optimizerD=torch.optim.Adam(lr=args.d_lr, params=d.parameters()),
+        optimizerG=torch.optim.Adam(g.parameters(), lr=args.g_lr),
+        optimizerD=torch.optim.Adam(d.parameters(), lr=args.d_lr),
         latent_sampler=LatentSamplerLambda(
-            lambda b, d: torch.randn(b, d) * 2,
+            lambda b, d: torch.randn(b, d),
             b=args.batch_size,
             d=args.latent_dim,
         ),
@@ -218,14 +204,17 @@ def run_experiment(
 
     initial_best = buffer.B.get_value(0)
     initial_mean = buffer.B.get_mean_buffer_value()
+
     logger.info(
-        f"CartPole config: optimizer={args.optimizer} n_iter={args.n_iter} "
-        f"batch_size={args.batch_size} runs_per_env={args.runs_per_env} "
-        f"curiosity={args.curiosity} seed={args.seed}"
+        f"HalfCheetah config: optimizer={args.optimizer} env={args.env_id} "
+        f"n_iter={args.n_iter} batch_size={args.batch_size} runs_per_env={args.runs_per_env} seed={args.seed}"
+    )
+    logger.info(
+        f"Policy parameterization: obs_dim={obs_dim} action_dim={action_dim} f_dim={f_dim}"
     )
     logger.info(
         f"Initial best={initial_best:.4f} mean={initial_mean:.4f} "
-        f"(optimum is {-args.episode_steps:.1f})"
+        f"(remember: more negative = better because we minimize negative return)"
     )
     if show_tables:
         logger.info("Initial top-5 buffer values")
@@ -236,6 +225,7 @@ def run_experiment(
     final_best = buffer.B.get_value(0)
     final_mean = buffer.B.get_mean_buffer_value()
     improvement = final_best - initial_best
+
     logger.info(
         f"Final best={final_best:.4f} mean={final_mean:.4f} improvement={improvement:.4f}"
     )
@@ -243,9 +233,12 @@ def run_experiment(
         logger.info("Top-5 buffer values after optimization")
         buffer.B.print_values(slice(0, 5, 1))
 
-    test_evaluator = CartPoleEvaluator(
+    test_evaluator = LinearContinuousPolicyEvaluator(
+        args.env_id,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
         episode_steps=args.generalization_steps,
-        runs_per_env=max(5, args.runs_per_env),
+        runs_per_env=max(3, args.runs_per_env),
         seed=args.seed + 123_456,
     )
     test_results = test_evaluator(buffer.B.get_top_k(5))
@@ -266,6 +259,9 @@ def run_experiment(
         "improvement": improvement,
         "generalization_best": generalization_best,
         "generalization_top5": test_results,
+        "obs_dim": obs_dim,
+        "action_dim": action_dim,
+        "f_dim": f_dim,
     }
 
 
