@@ -54,6 +54,154 @@ It also improves the best individual 40x20 result from `72.9039` at 10k to
 `72.5222` at 3k. The older `topk_volume + density_filter_radius=1 +
 projection_beta=1` result was `90.7142` at 10k.
 
+Smoothed rerun of this baseline:
+
+```text
+artifact:
+  results/topopt_best40_sorted_material_centered_l2_smoothed_3k_seed0/top_designs_curiosity_0.0003_seed_0.npz
+
+same current-best baseline, except:
+  density_filter_radius=1
+
+3k seed 0:
+  best_feasible_compliance=94.3184
+  mean top9 compliance=94.4403
+  mean_hamming=0.0047
+  intermediate-density pixel count in top9=2822
+```
+
+Blob-initialized rerun of this baseline:
+
+```text
+artifact:
+  results/topopt_best40_sorted_material_centered_l2_blobinit_3k_seed0/top_designs_curiosity_0.0003_seed_0.npz
+
+same current-best baseline, except:
+  initial_buffer_mode=random_blobs
+  initial_blob_count_max=8
+  initial_blob_radius_min=0.04
+  initial_blob_radius_max=0.30
+  initial_blob_min_hamming=0.2
+
+3k seed 0:
+  best_feasible_compliance=76.4370
+  mean top9 compliance=76.4423
+  feasible_rate=1.0
+  mean_hamming=0.0011
+  intermediate-density pixel count in top9=0
+```
+
+Large-batch generator-init rerun of this baseline:
+
+```text
+artifact:
+  results/topopt_best40_sorted_material_centered_l2_bs512_buf1024_500_seed0/top_designs_curiosity_0.0003_seed_0.npz
+
+same current-best baseline, except:
+  batch_size=512
+  buffer_multiplier=2
+  buffer_size=1024
+  n_iter=500
+
+500 iter seed 0:
+  eval_count=257024
+  best_feasible_compliance=73.8842
+  mean top9 compliance=73.9672
+  feasible_rate=1.0
+  mean_hamming=0.0201
+  intermediate-density pixel count in top9=0
+  runtime=24:52
+```
+
+The large-batch run had a long delayed improvement phase: it stayed above
+`220` until roughly iteration 160, then reached the 90s by iteration 220 and
+the 70s by iteration 270. It did not beat the best seed-0 small-batch baseline
+(`73.88` vs `72.52`), but it is competitive with the seed-2 small-batch result
+and better than the blob-init 3k run.
+
+Takeaway: full smoothing hurts the best-quality baseline. It quickly converges
+to one nearly repeated grey-density bridge and does not approach the unsmoothed
+baseline (`94.32` vs `72.52`). Blob init without smoothing is much healthier
+and stays fully binary, but it still trails the generator-initialized seed-0
+baseline (`76.44` vs `72.52`) and collapses to near-identical top designs. Use
+`density_filter_radius=0` and generator init for the current best 40x20 setting
+unless explicitly testing initialization effects.
+
+Plain non-ranking GAN rerun at large batch:
+
+```text
+common setting:
+  encoding=sorted_material
+  sorted_material_profile=binary
+  density_filter_radius=0
+  projection_beta=0
+  generator_type=conv
+  generator_output_norm=centered_l2
+  discriminator_type=mlp
+  optimizer_type=default
+  g_torch_optimizer=muon
+  d_torch_optimizer=muon
+  discriminator_steps=1
+  batch_size=512
+  buffer_multiplier=2
+  buffer_size=1024
+  n_iter=500
+  seed=0
+
+generator-init LR sweep:
+  g=0.01, d=0.03: best_feasible=87.5324
+  g=0.03, d=0.03: best_feasible=84.9266
+  g=0.03, d=0.10: best_feasible=90.0508
+  g=0.06, d=0.10: best_feasible=90.1839
+
+blob-init LR sweep:
+  g=0.01, d=0.03: best_feasible=90.8980
+  g=0.03, d=0.03: best_feasible=100.6767
+  g=0.03, d=0.10: best_feasible=120.5757
+  g=0.06, d=0.10: best_feasible=220.6838
+```
+
+The large-batch plain GAN result is much better than the older sorted-binary
+plain BCE GAN result (`134.7742` at 1k), but it remains behind the quantile
+ranker baseline. Visually it learns a plausible but highly collapsed diagonal
+cantilever family. Blob initialization is worse for plain GAN: it starts from a
+better initial archive but trains more slowly and ends below generator init.
+
+Plain GAN curiosity/diversity probe at the best generator-init LR
+(`g_lr=0.03`, `d_lr=0.03`, 500 iterations):
+
+```text
+raw Wang-Isola uniformity, curiosity_reference=buffer:
+  curiosity=0.001: best_feasible=86.8237
+  curiosity=0.003: best_feasible=78.8834
+
+Plummer repulsion in raw genome space:
+  curiosity=0.001: best_feasible=78.9355
+  curiosity=0.003: best_feasible=79.4305
+
+boundary-Chamfer diversity as a buffer ladder objective:
+  diversity:0.03: best_feasible=131.8867
+  diversity:0.05: best_feasible=190.3852
+```
+
+For `curiosity_space=raw`, uniformity is applied to the centered-L2-normalized
+raw generator score vectors, not to decoded binary topologies. With
+`curiosity_reference=buffer`, the loss concatenates the generated batch with a
+top-buffer batch, so gradients push current generated outputs away from each
+other and away from elite buffer score vectors. The buffer samples are constants.
+Plummer uses the same raw score vectors, embedded by the Plummer loss with
+layernorm. Topology-space curiosity is not available for `sorted_material`, so
+it was not tested here. Chamfer diversity is not a G-side curiosity loss; it is
+a buffer objective/constraint, and the tested bounds diluted compliance pressure
+badly.
+
+Takeaway: for plain GAN, small raw-space repulsion is useful and nearly closes
+the gap to the ranker baseline at 500 iterations (`78.88` vs `73.88` for the
+large-batch ranker run). The best plain-GAN variant is now raw uniformity
+`0.003`, essentially tied with Plummer `0.001`. Both still collapse around one
+motif but preserve more variation than no-curiosity GAN. Chamfer-style diversity
+should not be used as a default buffer objective in this setup.
+
 Interpretation: fixing the material amount/distribution and letting `G` only
 learn the ordering/placement is a strong representation. The binary material
 histogram beats smooth `linear` and `sigmoid` sorted histograms in the first
@@ -74,6 +222,144 @@ local neighborhoods. For topology optimization this means:
 - Track full learning curves, not only final best values.
 - Use one ranker update per iteration; tune learning rates instead of increasing
   ranker steps.
+
+## Matrix-Free Compliance Solver Probe
+
+The current custom SciPy FEM backend is forward-only but not matrix-free: for
+each design it assembles a reduced sparse stiffness matrix and calls
+`scipy.sparse.linalg.spsolve`. Population parallelism is currently
+`ThreadPoolExecutor.map(...)` over designs.
+
+Added a comparison utility:
+
+```text
+examples/topology_optimization/compare_matrix_free_cg.py
+```
+
+It loads saved physical designs, evaluates direct sparse compliance, then
+solves the same systems with a batched matrix-free elasticity operator and
+Jacobi-preconditioned CG.
+
+40x20 sanity check on the blob-init baseline artifact:
+
+```text
+top_k=3, e_min/e_max=1e-3, tol=1e-8, max_iter=1000
+direct vs CG compliance relative error: <= 4.6e-13
+CG iterations: 358 for all three designs
+```
+
+TOM 150x100 check on
+`results/tom_cantilever_blobinit_nosmooth_lr_g0p03_d0p03_iter1000_seed0`:
+
+```text
+top_k=1, e_min/e_max=1e-6, tol=1e-6, max_iter=5000
+direct compliance = 0.0115316536762
+CG compliance     = 0.0115316536573
+relative error    = 1.64e-9
+CG iterations     = 2656
+```
+
+For the TOM top-4 batch with the default `e_min/e_max=1e-6`, the first two
+designs converged by 5000 iterations but the other two still had residuals
+around `5e-5`. Compliance was still close:
+
+```text
+top_k=4, tol=1e-6, max_iter=5000
+relative compliance error range: 1.6e-9 .. 1.3e-5
+CG iterations: 2656, 4344, 5000, 5000
+```
+
+A fixed 2000-iteration CG budget on the same TOM batch gave roughly
+`3e-5 .. 1.4e-4` relative compliance error. A fixed 1000-iteration budget gave
+roughly `0.6%` error. This confirms the matrix-free operator is numerically
+compatible, but TOM's `1e-6` stiffness floor creates the expected CG iteration
+problem. A `1e-3` stiffness floor changes the direct compliance for these
+binary TOM designs by about `1%`, so using that floor is not a pure solver
+implementation detail; it changes the benchmark objective slightly.
+
+Integrated the matrix-free path into the 40x20 optimizer loop with:
+
+```text
+--compliance_solver matrix_free_cg
+--matrix_free_cg_max_iter 1000
+--matrix_free_cg_tol 1e-6
+```
+
+50-iteration smoke on the current best 40x20 setting:
+
+```text
+matrix-free artifact:
+  results/topopt_best40_sorted_material_centered_l2_matrixfreecg_smoke50_seed0/top_designs_curiosity_0.0003_seed_0.npz
+
+direct artifact:
+  results/topopt_best40_sorted_material_centered_l2_direct_smoke50_seed0/top_designs_curiosity_0.0003_seed_0.npz
+
+matrix-free final best_feasible_compliance = 194.2675
+direct final best_feasible_compliance      = 194.2675
+matrix-free mean top9 compliance           = 284.5922
+direct mean top9 compliance                = 284.5922
+saved top designs equal                    = true
+actual compliance max abs diff             = 0.0
+```
+
+Runtime on local CPU:
+
+```text
+matrix-free 50 iter: 3:00 total, initial buffer 0:29
+direct 50 iter:      0:26 total, initial buffer 0:02
+```
+
+MPS/Metal smoke on the same 50-iteration setting:
+
+```text
+artifact:
+  results/topopt_best40_sorted_material_centered_l2_matrixfreecg_mps_smoke50_seed0/top_designs_curiosity_0.0003_seed_0.npz
+
+--matrix_free_cg_device mps
+--matrix_free_cg_dtype float32
+
+MPS matrix-free final best_feasible_compliance = 208.1269
+direct re-score of MPS top design               = 207.8801
+MPS matrix-free mean top9 compliance            = 299.4609
+runtime                                         = 3:02 total
+initial buffer                                  = 0:31
+```
+
+The MPS path works only in float32. PyTorch MPS does not implement
+`index_copy`, so the active-subset CG optimization is disabled on MPS and full
+batch matvecs are used. On this 40x20 CPU-local benchmark, MPS gives no speedup
+over CPU matrix-free CG and is much slower than direct sparse solves. The
+float32 path also changes early ranking enough to select a worse top design
+(`207.88` direct re-score vs `194.27` for CPU/direct at 50 iterations).
+
+MPS large-batch throughput probe:
+
+```text
+artifact:
+  results/topopt_best40_sorted_material_centered_l2_matrixfreecg_mps_batch512_smoke10_seed0/top_designs_curiosity_0.0003_seed_0.npz
+
+--batch_size 512
+--buffer_multiplier 1
+--n_iter 10
+
+initial buffer: 512 designs in one MPS batch, 0:06
+full run: 5632 evaluations, 1:14 optimizer time
+best_feasible_compliance: 452.4799
+```
+
+Compared with the earlier MPS `batch_size=64` smoke, the one-shot 512-design
+evaluation is much better for GPU utilization (`0:06` for 512 vs `0:31` for
+8x64 chunks). This is a throughput win per compliance. It is not a free training
+win: at fixed evaluation budget, larger batches mean fewer G/D/ranker update
+steps, and this 10-step batch-512 probe did not improve beyond the initial
+buffer.
+
+Takeaway: the matrix-free CG loop is optimizer-compatible and matches the
+direct solver on the small problem, but the current PyTorch CPU implementation
+is much slower than sparse direct solves at 40x20. The current PyTorch MPS path
+is not better for this workload. This remains useful as a correctness prototype
+for a future GPU/JAX batched version, not as a replacement for the local
+small-grid CPU baseline.
 
 ## Mixed Evaluated Ranker Test
 
@@ -759,3 +1045,645 @@ bash examples/topology_optimization/run_topopt_spatial_lessons_suite.sh
 
 The bar to beat is currently `74.2849` at 3k and `72.9039` at 10k on the
 40x20 sorted-binary center-load benchmark.
+
+## Multi-Niche Elite Buffers
+
+Implemented an example-local `NicheEliteBuffer` in `cantilever_fem.py`. It
+keeps several independent elite buffers, chooses niche representatives by
+decoded-design Hamming distance, assigns candidates to nearest niches, and
+exposes either a `balanced` round-robin view or a globally sorted view to D and
+history. Relevant flags:
+
+```text
+--niche_buffer_count N
+--niche_buffer_min_hamming H
+--niche_buffer_view_mode balanced|global
+```
+
+First tests used the strong blob + Plummer baseline:
+
+```text
+grid=40x20, encoding=sorted_material, sorted_material_profile=binary
+G=conv, G output norm=centered_l2, D=mlp, spectral norm=true
+optimizer=quantile_ranked_default, tau=4, ranker_weight=1
+Muon/Muon, g_lr=0.03, d_lr=0.1
+batch_size=64, curiosity=0.003, curiosity_space=plummer
+initial_buffer_mode=random_blobs
+```
+
+Results at 500 iterations:
+
+```text
+single buffer reference:
+  buffer_multiplier=2
+  best_feasible=83.186
+  final 3k top9 mean_hamming=0.0279
+
+4 niches, balanced view:
+  buffer_multiplier=4, total buffer=256, hamming=0.2
+  best_feasible=166.182
+  mean top/archive=540.894
+  top9 mean_hamming=0.1048
+  conclusion: too much weak-niche retention, D/G signal diluted.
+
+4 niches, global view:
+  buffer_multiplier=4, total buffer=256, hamming=0.2
+  ranker_sample_pool_size=256
+  best_feasible=137.175
+  mean top/archive=240.815
+  top9 mean_hamming=0.0847
+  conclusion: better than balanced but still over-constrained.
+
+2 niches, balanced view:
+  buffer_multiplier=2, total buffer=128, hamming=0.1
+  best_feasible=81.500
+  mean top/archive=97.303
+  top9 mean_hamming=0.0705
+  conclusion: promising; beats the 500-iter single-buffer trace while keeping
+  more diversity.
+```
+
+Important implementation correction: the first niche rebuild underfilled the
+archive when nearest-representative clusters were imbalanced. The current code
+fills underfull niches from ranked overflow, so the buffer reaches full
+capacity when enough candidates exist.
+
+Longer 2-niche continuation:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same 2-niche balanced setting, 3k iterations:
+  best_feasible=76.9707
+  mean top/archive=78.1284
+  mean top9 compliance=77.2283
+  mean_hamming=0.0379
+  feasible_rate=1.000
+
+per-niche final state:
+  niche 0: best=76.9707, mean=77.6678
+  niche 1: best=77.9342, mean=78.5889
+  representative min Hamming=0.0400
+```
+
+Takeaway: the 2-niche archive remains viable and reaches a good result, but it
+does not beat the single-buffer blob+Plummer 3k reference (`74.0962`). The
+representatives also drift far below the requested `0.1` Hamming separation by
+the end. This confirms the next niche work should preserve identity more
+directly rather than simply extending balanced 2-niche training.
+
+Implementation update: the niche buffer no longer rebuilds all niches globally
+on every insert. It now seeds stable niche anchors, routes each new candidate to
+the nearest anchor by decoded-design Hamming distance, and inserts only into
+that niche's private buffer. Existing samples do not move between niches. The
+combined `balanced`/`global` views still expose samples from all niches to the
+shared G/D training path.
+
+First no-leak run:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same 2-niche balanced setting, stable-anchor/no-leak inserts, 3k iterations:
+  best_feasible=99.6439
+  mean top/archive=774.0004
+  mean top9 compliance=100.0028
+  mean_hamming=0.4315
+  feasible_rate=1.000
+
+per-niche final state:
+  niche 0: best=99.6439, mean=100.6197
+  niche 1: best=523.2489, mean=1447.3811
+  representative min Hamming=0.5325
+```
+
+Takeaway: strict no-leak routing preserves niche identity, but it starves the
+weak niche. The shared G discovers candidates near one anchor, while the other
+niche remains essentially at its initial blob quality. The useful next variant
+is not pure no-leak balanced exposure; it needs per-niche proposal pressure
+(sample G around each anchor, condition G on niche id, or route generated
+batches deliberately per niche) while still allowing D to compare across niches.
+
+Fixed clustered input-latent follow-up:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_fixedz_clusters_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak 2-niche setting, plus:
+  --fixed_latent_bank
+  --fixed_latent_selection clustered_niches
+  --fixed_latent_sample_mode balanced_niches
+  --fixed_latent_bank_size 128
+  --fixed_latent_niche_count 2
+  --fixed_latent_niche_center_scale 4.0
+  --fixed_latent_niche_within_std 0.35
+
+latent bank geometry:
+  within mean L2=3.4732
+  between min L2=10.1566
+  separation margin L2=5.0861
+
+3k final:
+  best_feasible=187.4819
+  mean top/archive=658.3960
+  mean top9 compliance=215.4255
+  mean_hamming=0.3813
+  feasible_rate=1.000
+
+per-niche final state:
+  niche 0: best=187.4819, mean=238.5990
+  niche 1: best=523.2489, mean=1078.1930
+  representative min Hamming=0.7000
+```
+
+Takeaway: fixed clustered z values do enforce latent-side separation, and they
+make the weak niche less bad than strict no-leak alone (`mean 1447 -> 1078`).
+But the good niche quality collapses (`best 99.64 -> 187.48`, `top9 100.00 ->
+215.43`). This looks like a proposal-reach problem: the hard fixed bank and
+balanced latent batches preserve identity, but they make the shared G less able
+to exploit the one niche that was learning useful structures. If revisiting this
+variant, add mild z jitter or use a condition/niche-id input with fresh samples
+inside each latent cluster instead of a fully fixed bank.
+
+Niche-local rank-target follow-up:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak 2-niche setting, no fixed latent bank, plus:
+  --ranker_niche_local_targets
+
+mechanism:
+  D real loss is built from separate rank lists inside each niche.
+  The best sample in each private niche receives the high quantile target for
+  that niche, instead of weak-niche samples being assigned low targets because
+  the other niche has globally lower compliance.
+
+3k final:
+  best_feasible=75.5635
+  mean top/archive=76.5664
+  mean top9 compliance=75.7787
+  mean_hamming=0.0338
+  feasible_rate=1.000
+
+per-niche final state:
+  niche 0: best=76.4415, mean=77.1168
+  niche 1: best=75.5635, mean=76.0159
+  representative min Hamming=0.0250
+```
+
+Takeaway: this directly fixes the starvation failure. Both niches now receive
+useful D targets, and the final quality beats the earlier leaky 2-niche run
+(`76.9707`) while avoiding the catastrophic weak-niche archive (`1447` mean).
+However, it does not preserve meaningful niche identity: the final
+representative distance collapses to `0.025`, below both the requested `0.1`
+and the old leaky run's `0.04`. The next useful variant should keep
+`--ranker_niche_local_targets`, then add an explicit representative-distance or
+per-niche proposal-distance constraint so quality and identity are enforced at
+the same time.
+
+Next reasonable niche experiments:
+
+```text
+1. Keep niche-local D targets, then add a minimum final-representative-distance
+   rule or per-niche proposal-distance filter before insertion.
+2. Condition G/D on niche id only after the representative-distance constraint
+   is tested; the local rank-target result shows conditioning is not required
+   for quality.
+3. Sweep hamming in {0.05, 0.1, 0.15} after quality+identity works together.
+4. Try 3 niches only if 2 niches improves after identity preservation; 4 niches
+   was too strong.
+```
+
+Follow-up implementation:
+
+```text
+--initial_blob_cluster_niches
+```
+
+This clusters the random blob seed candidates into balanced Hamming-distance
+niches before initial buffer fill. The initial labels are queued into
+`NicheEliteBuffer`, so the replayed/evaluated seed codes are inserted directly
+into their assigned niche. Artifacts now save:
+
+```text
+niche_history
+niche_history_columns
+initial_blob_niche_labels
+initial_blob_cluster_internal_mean_hamming
+initial_blob_cluster_external_mean_hamming
+initial_blob_cluster_separation_margin
+```
+
+First clustered-init test, same 2-niche 500-iter setting:
+
+```text
+init cluster internal mean Hamming=0.2322
+init cluster external mean Hamming=0.6729
+init cluster margin=0.4407
+
+final best_feasible=87.4029
+final top9 mean_hamming=0.0687
+
+per-niche best at 500:
+  niche 0: 87.4029, mean=90.486
+  niche 1: 91.268,  mean=100.180
+  representative min Hamming=0.0625
+```
+
+Takeaway: clustered init gives a cleaner and better-separated start, but in
+this configuration it underperforms unclustered 2-niche init (`81.5005`) and the
+niche representatives still collapse toward the same structural family. The
+next useful variant is not stronger initial clustering; it is preserving niche
+identity longer, e.g. by using stable medoids/anchors or a minimum
+representative-distance constraint during rebuild.
+
+Niche-output separation follow-up:
+
+```text
+new flags:
+  --niche_output_separation_weight W
+  --niche_output_separation_margin M
+
+mechanism:
+  During G updates, decode the generated batch into topology proxies, assign
+  each generated sample to the nearest stable niche anchor, compute centered-L2
+  raw-output prototypes for each represented niche, and penalize prototype
+  distances below M. This is differentiable through raw G outputs, while the
+  niche assignment is the same decoded-proximity rule used for insertion.
+```
+
+Smoke, 60 iterations:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_sep_w0p25_m035_smoke60_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak + niche-local-ranker setting, plus:
+  --niche_output_separation_weight 0.25
+  --niche_output_separation_margin 0.35
+
+final:
+  best_feasible=329.9935
+  top9 mean_hamming=0.4137
+
+per-niche:
+  niche 0: best=367.7154, mean=424.7095
+  niche 1: best=329.9935, mean=459.3786
+  representative min Hamming=0.5275
+```
+
+The smoke confirmed the loss was active: early generated families were very
+different across niches, but quality was still far from meaningful.
+
+500-iteration mild separation:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_sep_w0p25_m035_500_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+final:
+  best_feasible=107.0810
+  mean top/archive=112.1495
+  mean top9 compliance=108.0687
+  mean_hamming=0.0567
+  feasible_rate=1.000
+
+per-niche:
+  niche 0: best=110.2407, mean=110.9729
+  niche 1: best=107.0810, mean=107.6501
+  representative min Hamming=0.06375
+```
+
+500-iteration stronger separation:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_sep_w1_m05_500_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same setting, plus:
+  --niche_output_separation_weight 1.0
+  --niche_output_separation_margin 0.5
+
+final:
+  best_feasible=117.4045
+  mean top/archive=123.7170
+  mean top9 compliance=119.9908
+  mean_hamming=0.0570
+  feasible_rate=1.000
+
+per-niche:
+  niche 0: best=117.4045, mean=119.3847
+  niche 1: best=120.6976, mean=121.5489
+  representative min Hamming=0.03875
+```
+
+Takeaway: raw-output prototype separation is a partial/negative result. It
+raises 500-iteration representative distance relative to the 3k local-ranker
+collapse (`0.025 -> 0.06375` in the mild case), but it does not clear the
+requested `0.1` Hamming separation and the designs visually remain the same
+diagonal-bridge family. Increasing the loss weight makes quality worse and does
+not improve final decoded representative distance. The next attempt should
+enforce separation in decoded/topology space at insertion or selection time,
+not only through a raw-output G-side prototype penalty.
+
+Decoded cross-niche insertion gate:
+
+```text
+new flags:
+  --niche_buffer_cross_min_hamming H
+  --niche_buffer_cross_reference_top_k K
+
+mechanism:
+  For normal NicheEliteBuffer insertions, route each decoded topology proxy to
+  the nearest stable niche anchor, then reject it if it is less than H Hamming
+  distance from the top K reference designs in any other niche. Initial queued
+  niche seeds are not filtered. D/G still see the shared balanced/global view;
+  the constraint is applied only at insertion.
+```
+
+500-iteration gate-only run:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_500_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak + niche-local-ranker setting, plus:
+  --niche_buffer_cross_min_hamming 0.1
+  --niche_buffer_cross_reference_top_k 1
+
+final:
+  best_feasible=108.2415
+  mean top9 compliance=109.8086
+  mean_hamming=0.1074
+  feasible_rate=1.000
+
+per-niche:
+  niche 0: best=111.5796, mean=114.5568
+  niche 1: best=108.2415, mean=109.2404
+  representative min Hamming=0.1600
+  cross-top min Hamming=0.0925
+  cross-top mean Hamming=0.1429
+```
+
+3k gate-only continuation:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak + niche-local-ranker + cross-Hamming gate setting, plus:
+  --n_iter 3000
+
+final:
+  best_feasible=94.1112
+  mean top9 compliance=94.1866
+  archive mean compliance=96.9367
+  mean_hamming=0.1199
+  feasible_rate=1.000
+
+per-niche:
+  niche 0: best=98.4199, mean=98.6250
+  niche 1: best=94.1112, mean=94.1529
+  representative min Hamming=0.1975
+  cross-top min Hamming=0.16875
+  cross-top mean Hamming=0.1897
+```
+
+Important caveat: the run above used the default density filter and did not set
+`--hard_binarize`. Even with `--sorted_material_profile binary`, the binary
+sorted-material mask is passed through `density_filter_radius=1`, so the saved
+and evaluated physical densities contain intermediate material values at
+boundaries.
+
+3k hard-binary gate run:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_hardbin_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak + niche-local-ranker + cross-Hamming gate setting, plus:
+  --n_iter 3000
+  --hard_binarize
+
+final:
+  best_feasible=78.6955
+  mean top9 compliance=79.0188
+  archive mean compliance=79.7406
+  mean_hamming=0.0828
+  feasible_rate=1.000
+  intermediate-density pixel count=0
+
+per-niche:
+  niche 0: best=79.6075, mean=79.7189
+  niche 1: best=78.6955, mean=78.9646
+  representative min Hamming=0.1000
+  cross-top min Hamming=0.1000
+  cross-top mean Hamming=0.1203
+```
+
+Takeaway: decoded-space insertion gating plus hard binarization gives the best
+quality result so far that uses only full-material/void physical densities. It
+also beats the grey-density 3k gate run on compliance (`94.1112 -> 78.6955`),
+so the grey boundary pixels were not required for quality. The tradeoff is that
+the niche identity is now weaker: the cross gate is binding exactly at the
+`0.1` threshold, top-9 mean Hamming drops to `0.0828`, and visually both rows
+are the same diagonal-bridge family with small edge/web-width differences. This
+is the current best manufacturable-style baseline, while the grey-density 3k
+run remains stronger evidence for larger visual niche separation.
+
+Because the gate only compares each candidate against the current top K
+other-niche references at insertion time, it is still not a general all-pairs
+guarantee. The next stricter run should increase
+`--niche_buffer_cross_reference_top_k` or add a final/selection-time all-pairs
+cross-niche distance constraint.
+
+Staged density-filter removal:
+
+```text
+--density_filter_warmup_iters N
+--density_filter_final_radius 0
+```
+
+This keeps `--density_filter_radius` active for iterations `1..N`, then switches
+the evaluator to the final radius before iteration `N+1`. The current archive is
+re-evaluated and rebuilt under the new radius at the switch, so old smoothed
+compliance values do not keep ranking the buffer. Artifacts now record
+`density_filter_active_radius`, `density_filter_switched`, and
+`density_filter_extra_eval_count`.
+
+This should be the next version of the niche run if we want smoothing as an
+early optimization aid but final designs/evaluation without smoothed material.
+
+3k staged-filter run:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_filterwarm500_final0_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak + niche-local-ranker + cross-Hamming gate setting, plus:
+  --density_filter_radius 1
+  --density_filter_warmup_iters 500
+  --density_filter_final_radius 0
+
+final:
+  best_feasible=144.9760
+  mean top9 compliance=156.3957
+  mean_hamming=0.3527
+  feasible_rate=1.000
+  intermediate-density pixel count=0
+  density_filter_active_radius=0
+  density_filter_extra_eval_count=24
+
+per-niche:
+  niche 0: best=144.9760, top6 mean=155.5201, full-buffer mean=163.1098
+  niche 1: best=150.1051, top6 mean=170.3927, full-buffer mean=183.4227
+  representative min Hamming=0.2975
+```
+
+Takeaway: staged smoothing removal did what it was supposed to do mechanically:
+the final archive is all full material/void, and the switch re-scored the
+buffer before continuing. It strongly preserves niche separation, much better
+than the hard-binary gate run (`rep min Hamming 0.2975` vs `0.1000`), but
+quality is much worse (`144.98` vs `78.70`). This looks like a diversity-heavy
+variant rather than a new best-quality baseline. If continuing from here, try a
+shorter smoothing warmup or a lower cross-Hamming threshold after the switch.
+
+3k staged-filter run, later switch:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_filterwarm1500_final0_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak + niche-local-ranker + cross-Hamming gate setting, plus:
+  --density_filter_radius 1
+  --density_filter_warmup_iters 1500
+  --density_filter_final_radius 0
+
+final:
+  best_feasible=129.8338
+  mean top9 compliance=133.2384
+  mean_hamming=0.2848
+  feasible_rate=1.000
+  intermediate-density pixel count=0
+  density_filter_active_radius=0
+  density_filter_extra_eval_count=24
+
+per-niche:
+  niche 0: best=129.8338, top6 mean=131.7557, full-buffer mean=136.5049
+  niche 1: best=132.5668, top6 mean=145.9197, full-buffer mean=152.3696
+  representative min Hamming=0.3350
+```
+
+Takeaway: switching later helps. Compared with the 500-switch run, compliance
+improves (`144.98 -> 129.83`) while decoded niche separation remains strong
+(`rep min Hamming 0.2975 -> 0.3350`). This suggests the poor quality of the
+500-switch version was partly due to cutting over before the smoothed objective
+had learned a decent topology. A 2000-switch run is worth checking next.
+
+3k staged-filter run, 2000-step switch:
+
+```text
+artifact:
+  results/topopt_blob_niche2_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_filterwarm2000_final0_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same no-leak + niche-local-ranker + cross-Hamming gate setting, plus:
+  --density_filter_radius 1
+  --density_filter_warmup_iters 2000
+  --density_filter_final_radius 0
+
+final:
+  best_feasible=91.5336
+  mean top9 compliance=95.3073
+  mean_hamming=0.0853
+  feasible_rate=1.000
+  intermediate-density pixel count=0
+  density_filter_active_radius=0
+  density_filter_extra_eval_count=24
+
+per-niche:
+  niche 0: best=91.5336, top6 mean=96.4382, full-buffer mean=98.5198
+  niche 1: best=93.7350, top6 mean=95.7280, full-buffer mean=97.1832
+  representative min Hamming=0.1225
+```
+
+Takeaway: 2000-step smoothing is the best staged-filter setting so far. It is
+fully binary after switch, beats the 500- and 1500-switch runs on compliance,
+and still keeps representative separation above the target (`0.1225`). It is
+also competitive with the grey-density 3k gate run on best compliance
+(`91.53` vs `94.11`) while avoiding intermediate material. It still does not
+match the hard-binarized filter baseline on quality (`78.70`), but that run had
+weaker niche identity (`rep min Hamming 0.1000`). This is now the better
+quality/diversity compromise among the no-smoothing-at-finish runs.
+
+5-niche smoothed stress test:
+
+```text
+artifact:
+  results/topopt_blob_niche5_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_smoothed_3k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same smoothed no-leak + niche-local-ranker + cross-Hamming gate setting, plus:
+  --niche_buffer_count 5
+  --density_filter_radius 1
+
+final:
+  best_feasible=178.3232
+  mean top9 compliance=210.5140
+  archive mean compliance=279.1735
+  mean_hamming=0.3959
+  feasible_rate=1.000
+  intermediate-density pixel count in top9=2777
+
+per-niche:
+  niche 0: best=186.2429, mean=216.1273
+  niche 1: best=240.9352, mean=281.3757
+  niche 2: best=272.4778, mean=304.2282
+  niche 3: best=349.1482, mean=373.2044
+  niche 4: best=178.3232, mean=206.3714
+  representative min Hamming range=0.1600..0.2900
+```
+
+Takeaway: five niches are too many for the current 24-slot archive and shared
+generator pressure. The run preserves visual diversity and all niches remain
+feasible, but several niches are weak, and the best result is far worse than
+the 2-niche smoothed gate run (`178.32` vs `94.11`). If revisiting 5 niches,
+increase buffer size and probably batch size before changing the optimizer.
+
+5-niche smoothed 10k continuation:
+
+```text
+artifact:
+  results/topopt_blob_niche5_h010_plummer_no_leak_niche_local_ranker_crossham010_top1_smoothed_10k_seed0/top_designs_curiosity_0.003_seed_0.npz
+
+same 5-niche smoothed setting, plus:
+  --n_iter 10000
+  --history_interval 50
+
+final:
+  best_feasible=105.3669
+  mean top9 compliance=107.5479
+  archive mean compliance=119.8044
+  mean_hamming=0.1433
+  feasible_rate=1.000
+  intermediate-density pixel count in top9=2199
+
+per-niche:
+  niche 0: best=105.3669, mean=106.9502
+  niche 1: best=111.4819, mean=112.0167
+  niche 2: best=138.1243, mean=139.8225
+  niche 3: best=126.0363, mean=129.6359
+  niche 4: best=107.4258, mean=108.2950
+  representative min Hamming range=0.1000..0.1100
+```
+
+Takeaway: longer training materially improves the 5-niche setting
+(`178.32 -> 105.37` best feasible), so the 3k result was undertrained. However,
+the five niches mostly converge to variants of the same diagonal bridge; the
+representative distances sit exactly at the cross-Hamming threshold, and two
+niches remain notably weaker. This is not a compelling 5-niche win yet. The
+next fair 5-niche attempt should scale capacity, e.g. increase buffer and batch
+so each niche gets at least the same number of slots as the 2-niche run.

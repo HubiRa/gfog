@@ -58,7 +58,7 @@ EncodingMode = Literal[
 ]
 
 
-LadderKind = Literal["volume", "compliance", "roughness", "connectivity"]
+LadderKind = Literal["volume", "compliance", "roughness", "connectivity", "diversity"]
 LOAD_CASE_CHOICES = (
     "center_point",
     "right_top_point",
@@ -79,10 +79,20 @@ LoadCase = Literal[
 ]
 RobustLoadAggregate = Literal["max", "mean", "cvar"]
 ProblemPreset = Literal["default", "tom_cantilever_2d"]
+ComplianceSolver = Literal["direct", "matrix_free_cg"]
+MatrixFreeCGDType = Literal["float32", "float64"]
 SortedMaterialProfile = Literal["binary", "linear", "sigmoid"]
 ConvActivation = Literal["leaky_relu", "gelu", "silu"]
 LatentDistribution = Literal["normal", "uniform"]
 DesignProxyFn = Callable[[torch.Tensor], torch.Tensor]
+
+
+def matrix_free_cg_torch_dtype(dtype_name: MatrixFreeCGDType) -> torch.dtype:
+    if dtype_name == "float32":
+        return torch.float32
+    if dtype_name == "float64":
+        return torch.float64
+    raise ValueError(f"Unknown matrix-free CG dtype: {dtype_name}")
 
 
 class ConvDecoderGenerator(nn.Module):
@@ -320,7 +330,8 @@ class FixedLatentBankSampler(LatentSamplerBase):
         self,
         bank: torch.Tensor,
         batch_size: int,
-        mode: Literal["random", "shuffle_cycle"] = "shuffle_cycle",
+        mode: Literal["random", "shuffle_cycle", "balanced_niches"] = "shuffle_cycle",
+        cluster_labels: torch.Tensor | None = None,
         noise_std: float = 0.0,
         normalize_noise_scale: bool = True,
     ) -> None:
@@ -330,7 +341,7 @@ class FixedLatentBankSampler(LatentSamplerBase):
             raise ValueError(
                 f"fixed latent bank size must be >= batch_size, got {len(bank)} and {batch_size}"
             )
-        if mode not in {"random", "shuffle_cycle"}:
+        if mode not in {"random", "shuffle_cycle", "balanced_niches"}:
             raise ValueError(f"Unknown fixed latent sample mode: {mode}")
         if noise_std < 0:
             raise ValueError(
@@ -343,6 +354,50 @@ class FixedLatentBankSampler(LatentSamplerBase):
         self.normalize_noise_scale = normalize_noise_scale
         self._order = torch.empty(0, dtype=torch.long, device=self.bank.device)
         self._position = 0
+        self.cluster_labels: torch.Tensor | None = None
+        self._cluster_member_indices: list[torch.Tensor] = []
+        self._cluster_orders: list[torch.Tensor] = []
+        self._cluster_positions: list[int] = []
+        self._cluster_batch_counts: list[int] = []
+        if mode == "balanced_niches":
+            if cluster_labels is None:
+                raise ValueError(
+                    "fixed_latent_sample_mode=balanced_niches requires clustered latent labels"
+                )
+            labels = (
+                cluster_labels.detach()
+                .clone()
+                .to(device=self.bank.device, dtype=torch.long)
+            )
+            if labels.ndim != 1 or len(labels) != len(self.bank):
+                raise ValueError(
+                    "fixed latent cluster_labels must be 1D with one label per bank entry"
+                )
+            unique_labels = torch.unique(labels, sorted=True)
+            if len(unique_labels) < 2:
+                raise ValueError(
+                    "fixed_latent_sample_mode=balanced_niches requires at least two latent niches"
+                )
+            self.cluster_labels = labels
+            self._cluster_member_indices = [
+                torch.nonzero(labels == label, as_tuple=False).flatten()
+                for label in unique_labels
+            ]
+            if min(len(indices) for indices in self._cluster_member_indices) <= 0:
+                raise ValueError(
+                    "fixed latent niches must all contain at least one entry"
+                )
+            self._cluster_orders = [
+                torch.empty(0, dtype=torch.long, device=self.bank.device)
+                for _ in self._cluster_member_indices
+            ]
+            self._cluster_positions = [0 for _ in self._cluster_member_indices]
+            base = batch_size // len(self._cluster_member_indices)
+            remainder = batch_size % len(self._cluster_member_indices)
+            self._cluster_batch_counts = [
+                base + (1 if cluster_idx < remainder else 0)
+                for cluster_idx in range(len(self._cluster_member_indices))
+            ]
 
     def __call__(self) -> torch.Tensor:
         if self.mode == "random":
@@ -354,6 +409,18 @@ class FixedLatentBankSampler(LatentSamplerBase):
             z = self.bank[index]
             return self._jitter(z)
 
+        if self.mode == "balanced_niches":
+            index = torch.cat(
+                [
+                    self._take_from_cluster(cluster_idx, count)
+                    for cluster_idx, count in enumerate(self._cluster_batch_counts)
+                    if count > 0
+                ]
+            )
+            index = index[torch.randperm(len(index), device=self.bank.device)]
+            z = self.bank[index]
+            return self._jitter(z)
+
         if self._position + self.batch_size > len(self._order):
             self._order = torch.randperm(len(self.bank), device=self.bank.device)
             self._position = 0
@@ -362,6 +429,26 @@ class FixedLatentBankSampler(LatentSamplerBase):
         z = self.bank[index]
         return self._jitter(z)
 
+    def _take_from_cluster(self, cluster_idx: int, count: int) -> torch.Tensor:
+        members = self._cluster_member_indices[cluster_idx]
+        chunks: list[torch.Tensor] = []
+        remaining = count
+        while remaining > 0:
+            if self._cluster_positions[cluster_idx] >= len(
+                self._cluster_orders[cluster_idx]
+            ):
+                self._cluster_orders[cluster_idx] = members[
+                    torch.randperm(len(members), device=self.bank.device)
+                ]
+                self._cluster_positions[cluster_idx] = 0
+            position = self._cluster_positions[cluster_idx]
+            order = self._cluster_orders[cluster_idx]
+            take = min(remaining, len(order) - position)
+            chunks.append(order[position : position + take])
+            self._cluster_positions[cluster_idx] += take
+            remaining -= take
+        return torch.cat(chunks)
+
     def _jitter(self, z: torch.Tensor) -> torch.Tensor:
         if self.noise_std == 0:
             return z
@@ -369,6 +456,28 @@ class FixedLatentBankSampler(LatentSamplerBase):
         if self.normalize_noise_scale:
             z = z / math.sqrt(1.0 + self.noise_std * self.noise_std)
         return z
+
+
+class InitialBufferReplayGenerator(nn.Module):
+    """Replay fixed genome codes during initial buffer fill, then defer to G."""
+
+    def __init__(self, codes: torch.Tensor, fallback: nn.Module) -> None:
+        super().__init__()
+        if codes.ndim != 2:
+            raise ValueError(
+                f"initial buffer codes must be 2D, got {tuple(codes.shape)}"
+            )
+        self.register_buffer("codes", codes.detach().clone())
+        self.fallback = fallback
+        self.position = 0
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        batch_size = z.shape[0]
+        if self.position + batch_size <= self.codes.shape[0]:
+            out = self.codes[self.position : self.position + batch_size]
+            self.position += batch_size
+            return out.to(device=z.device, dtype=z.dtype)
+        return self.fallback(z)
 
 
 def sample_latents(
@@ -471,6 +580,88 @@ class FixedLatentBankUniformity(nn.Module):
         return self.weight * uniformity_loss(bank_outputs, t=self.t)
 
 
+class NicheOutputSeparationLoss(nn.Module):
+    """Repel generated outputs assigned to different stable niche anchors."""
+
+    def __init__(
+        self,
+        *,
+        buffer: Any,
+        design_proxy: DesignProxyFn,
+        weight: float,
+        margin: float,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        if weight < 0:
+            raise ValueError(
+                f"niche_output_separation_weight must be non-negative, got {weight}"
+            )
+        if margin <= 0:
+            raise ValueError(
+                f"niche_output_separation_margin must be positive, got {margin}"
+            )
+        if not hasattr(buffer, "niche_anchor_proxies"):
+            raise ValueError("niche output separation requires a NicheEliteBuffer")
+        self.buffer = buffer
+        self.design_proxy = design_proxy
+        self.weight = weight
+        self.margin = margin
+        self.eps = eps
+
+    def forward(self, g_out: torch.Tensor) -> torch.Tensor:
+        zero = torch.zeros((), device=g_out.device, dtype=g_out.dtype)
+        if self.weight <= 0 or g_out.shape[0] < 2:
+            return zero
+
+        anchors = [
+            anchor.reshape(-1).detach().to(torch.bool).cpu()
+            for anchor in self.buffer.niche_anchor_proxies
+            if anchor is not None
+        ]
+        if len(anchors) < 2:
+            return zero
+
+        with torch.no_grad():
+            proxies = self.design_proxy(g_out.detach())
+            if proxies.shape[0] != g_out.shape[0]:
+                raise ValueError(
+                    "niche output separation design_proxy must return one proxy "
+                    f"per generated output, got {proxies.shape[0]} for {g_out.shape[0]}"
+                )
+            proxy_flat = proxies.reshape(proxies.shape[0], -1).to(torch.bool).cpu()
+            anchor_flat = torch.stack(anchors)
+            if proxy_flat.shape[1] != anchor_flat.shape[1]:
+                raise ValueError(
+                    "niche output separation proxy dimension mismatch: "
+                    f"{proxy_flat.shape[1]} vs {anchor_flat.shape[1]}"
+                )
+            distances = (proxy_flat[:, None, :] != anchor_flat[None, :, :]).to(
+                torch.float32
+            )
+            labels = distances.mean(dim=2).argmin(dim=1).to(g_out.device)
+
+        flat = g_out.reshape(g_out.shape[0], -1)
+        flat = flat - flat.mean(dim=1, keepdim=True)
+        flat = F.normalize(flat, p=2, dim=1, eps=self.eps)
+
+        group_means: list[torch.Tensor] = []
+        for label in torch.unique(labels, sorted=True):
+            group = flat[labels == label]
+            if group.shape[0] == 0:
+                continue
+            mean = group.mean(dim=0)
+            group_means.append(F.normalize(mean, p=2, dim=0, eps=self.eps))
+        if len(group_means) < 2:
+            return zero
+
+        pairwise_distances = torch.pdist(torch.stack(group_means), p=2)
+        if pairwise_distances.numel() == 0:
+            return zero
+        penalty = F.relu(self.margin - pairwise_distances).pow(2).mean()
+        return self.weight * penalty
+
+
 class RankValueMLP(nn.Module):
     """MLP with an original rank head plus an auxiliary value head."""
 
@@ -567,6 +758,121 @@ def select_output_diverse_latent_bank(
         current = int(torch.argmax(min_distance).item())
 
     return candidates[selected].detach()
+
+
+@torch.no_grad()
+def make_clustered_niche_latent_bank(
+    *,
+    latent_dim: int,
+    bank_size: int,
+    niche_count: int,
+    center_scale: float,
+    within_std: float,
+    normalize_radius: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Create fixed latent niches with larger between-niche than within-niche gaps."""
+    if latent_dim <= 0:
+        raise ValueError(f"latent_dim must be positive, got {latent_dim}")
+    if bank_size <= 0:
+        raise ValueError(f"fixed_latent_bank_size must be > 0, got {bank_size}")
+    if niche_count <= 1:
+        raise ValueError(f"fixed_latent_niche_count must be >= 2, got {niche_count}")
+    if niche_count > bank_size:
+        raise ValueError(
+            f"fixed_latent_niche_count must not exceed bank size, got {niche_count} and {bank_size}"
+        )
+    if center_scale <= 0:
+        raise ValueError(
+            f"fixed_latent_niche_center_scale must be positive, got {center_scale}"
+        )
+    if within_std <= 0:
+        raise ValueError(
+            f"fixed_latent_niche_within_std must be positive, got {within_std}"
+        )
+
+    if niche_count == 2:
+        center = F.normalize(
+            torch.randn(1, latent_dim, device=device, dtype=dtype),
+            p=2,
+            dim=1,
+            eps=1e-8,
+        )
+        centers = torch.cat([center, -center], dim=0)
+    else:
+        candidate_count = max(256, niche_count * 128)
+        candidates = F.normalize(
+            torch.randn(candidate_count, latent_dim, device=device, dtype=dtype),
+            p=2,
+            dim=1,
+            eps=1e-8,
+        )
+        selected = torch.empty(niche_count, dtype=torch.long, device=device)
+        selected[0] = int(torch.randint(candidate_count, (1,), device=device).item())
+        min_distance = torch.full(
+            (candidate_count,), float("inf"), device=device, dtype=dtype
+        )
+        for idx in range(1, niche_count):
+            previous = int(selected[idx - 1].item())
+            distance = torch.cdist(candidates, candidates[previous : previous + 1])
+            distance = distance.flatten()
+            min_distance = torch.minimum(min_distance, distance)
+            min_distance[selected[:idx]] = -1.0
+            selected[idx] = int(torch.argmax(min_distance).item())
+        centers = candidates[selected]
+
+    capacities = niche_capacities(bank_size, niche_count)
+    bank_parts = []
+    label_parts = []
+    for niche_idx, capacity in enumerate(capacities):
+        centered = center_scale * centers[niche_idx].unsqueeze(0)
+        noise = within_std * torch.randn(
+            capacity, latent_dim, device=device, dtype=dtype
+        )
+        bank_parts.append(centered + noise)
+        label_parts.append(
+            torch.full((capacity,), niche_idx, device=device, dtype=torch.long)
+        )
+    bank = torch.cat(bank_parts, dim=0)
+    labels = torch.cat(label_parts, dim=0)
+    if normalize_radius:
+        bank = math.sqrt(latent_dim) * F.normalize(bank, p=2, dim=1, eps=1e-8)
+
+    permutation = torch.randperm(len(bank), device=device)
+    bank = bank[permutation].detach()
+    labels = labels[permutation].detach()
+
+    distances = torch.cdist(bank, bank)
+    same_label = labels[:, None] == labels[None, :]
+    off_diagonal = ~torch.eye(len(bank), dtype=torch.bool, device=device)
+    within = distances[same_label & off_diagonal]
+    between = distances[~same_label]
+    center_distances = torch.cdist(centers, centers)
+    center_between = center_distances[
+        ~torch.eye(niche_count, dtype=torch.bool, device=device)
+    ]
+
+    def finite_stat(values: torch.Tensor, reducer: str) -> float:
+        if len(values) == 0:
+            return float("nan")
+        if reducer == "min":
+            return float(values.min().item())
+        if reducer == "max":
+            return float(values.max().item())
+        return float(values.mean().item())
+
+    stats = {
+        "latent_niche_within_mean_l2": finite_stat(within, "mean"),
+        "latent_niche_within_max_l2": finite_stat(within, "max"),
+        "latent_niche_between_mean_l2": finite_stat(between, "mean"),
+        "latent_niche_between_min_l2": finite_stat(between, "min"),
+        "latent_niche_center_mean_l2": finite_stat(center_between, "mean"),
+    }
+    stats["latent_niche_separation_margin_l2"] = (
+        stats["latent_niche_between_min_l2"] - stats["latent_niche_within_max_l2"]
+    )
+    return bank, labels, stats
 
 
 class ConvDiscriminator(nn.Module):
@@ -691,9 +997,12 @@ class FEMConfig:
     compliance_ladder: tuple[float, ...] = ()
     roughness_ladder: tuple[float, ...] = ()
     connectivity_ladder: tuple[float, ...] = ()
+    diversity_ladder: tuple[float, ...] = ()
     ladder_sequence: tuple[tuple[LadderKind, float], ...] = ()
     use_levels_ladder: bool = False
     levels_ladder_objectives: tuple[str, ...] = ()
+    diversity_reference_size: int = 32
+    diversity_chamfer_max_points: int = 256
     load_scale: float = 1.0
     load_case: LoadCase = "center_point"
     robust_load_cases: tuple[LoadCase, ...] = ()
@@ -703,6 +1012,11 @@ class FEMConfig:
     removal_ladder_compliances: tuple[float, ...] = ()
     removal_ladder_connectivity_max: float | None = None
     fem_workers: int = 1
+    compliance_solver: ComplianceSolver = "direct"
+    matrix_free_cg_max_iter: int = 1000
+    matrix_free_cg_tol: float = 1e-6
+    matrix_free_cg_device: str = "cpu"
+    matrix_free_cg_dtype: MatrixFreeCGDType = "float64"
     sorted_material_profile: SortedMaterialProfile = "linear"
     sorted_material_steepness: float = 12.0
     density_filter_radius: int = 1
@@ -869,6 +1183,335 @@ def project_scores_to_fixed_sorted_material_numpy(
     out = np.empty_like(scores, dtype=np.float64)
     out[order] = values
     return out
+
+
+def random_blob_designs_numpy(
+    count: int,
+    *,
+    nely: int,
+    nelx: int,
+    target_mean: float,
+    rng: np.random.Generator,
+    blob_count_min: int,
+    blob_count_max: int,
+    radius_min: float,
+    radius_max: float,
+) -> np.ndarray:
+    """Create binary designs by placing random smooth material blobs."""
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
+    if blob_count_min < 1:
+        raise ValueError(f"blob_count_min must be >= 1, got {blob_count_min}")
+    if blob_count_max < blob_count_min:
+        raise ValueError(
+            "blob_count_max must be >= blob_count_min, got "
+            f"{blob_count_max} and {blob_count_min}"
+        )
+    if not 0.0 < radius_min <= radius_max:
+        raise ValueError(
+            f"blob radii must satisfy 0 < min <= max, got {radius_min}, {radius_max}"
+        )
+    n = nely * nelx
+    k = min(max(int(round(target_mean * n)), 1), n)
+    yy = (np.arange(nely, dtype=np.float64) + 0.5) / float(nely)
+    xx = (np.arange(nelx, dtype=np.float64) + 0.5) / float(nelx)
+    grid_y, grid_x = np.meshgrid(yy, xx, indexing="ij")
+    designs = np.zeros((count, nely, nelx), dtype=np.float32)
+    for idx in range(count):
+        field = np.zeros((nely, nelx), dtype=np.float64)
+        n_blobs = int(rng.integers(blob_count_min, blob_count_max + 1))
+        for _ in range(n_blobs):
+            cx = float(rng.uniform(0.0, 1.0))
+            cy = float(rng.uniform(0.0, 1.0))
+            rx = float(rng.uniform(radius_min, radius_max))
+            ry = float(rng.uniform(radius_min, radius_max))
+            strength = float(rng.uniform(0.5, 1.5))
+            dist = ((grid_x - cx) / rx) ** 2 + ((grid_y - cy) / ry) ** 2
+            field += strength * np.exp(-0.5 * dist)
+        field += 1e-3 * rng.standard_normal(size=field.shape)
+        flat = field.reshape(-1)
+        top_idx = np.argpartition(flat, -k)[-k:]
+        design = np.zeros(n, dtype=np.float32)
+        design[top_idx] = 1.0
+        designs[idx] = design.reshape(nely, nelx)
+    return designs
+
+
+def mean_pairwise_hamming_numpy(designs: np.ndarray) -> float:
+    flat = np.asarray(designs >= 0.5).reshape(designs.shape[0], -1)
+    if flat.shape[0] < 2:
+        return 0.0
+    dists = flat[:, None, :] != flat[None, :, :]
+    triu = np.triu_indices(flat.shape[0], k=1)
+    return float(dists.mean(axis=-1)[triu].mean())
+
+
+def min_pairwise_hamming_numpy(designs: np.ndarray) -> float:
+    flat = np.asarray(designs >= 0.5).reshape(designs.shape[0], -1)
+    if flat.shape[0] < 2:
+        return 0.0
+    dists = flat[:, None, :] != flat[None, :, :]
+    triu = np.triu_indices(flat.shape[0], k=1)
+    return float(dists.mean(axis=-1)[triu].min())
+
+
+def select_diverse_binary_designs_numpy(
+    designs: np.ndarray,
+    *,
+    count: int,
+    rng: np.random.Generator,
+    min_hamming: float,
+) -> np.ndarray:
+    """Deduplicate and greedily select binary designs by max-min Hamming distance."""
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
+    if min_hamming < 0:
+        raise ValueError(
+            f"initial_blob_min_hamming must be non-negative, got {min_hamming}"
+        )
+
+    flat = np.asarray(designs >= 0.5).reshape(designs.shape[0], -1)
+    _unique_flat, unique_idx = np.unique(flat, axis=0, return_index=True)
+    candidate_idx = np.sort(unique_idx)
+    candidates = flat[candidate_idx]
+    if candidates.shape[0] <= count:
+        return designs[candidate_idx].astype(np.float32, copy=False)
+
+    selected: list[int] = [int(rng.integers(0, candidates.shape[0]))]
+    remaining = np.ones(candidates.shape[0], dtype=bool)
+    remaining[selected[0]] = False
+    min_dist = (candidates != candidates[selected[0]]).mean(axis=1)
+    while len(selected) < count:
+        feasible = remaining & (min_dist >= min_hamming)
+        pool = feasible if np.any(feasible) else remaining
+        next_idx = int(np.argmax(np.where(pool, min_dist, -1.0)))
+        selected.append(next_idx)
+        remaining[next_idx] = False
+        new_dist = (candidates != candidates[next_idx]).mean(axis=1)
+        min_dist = np.minimum(min_dist, new_dist)
+    return candidates[selected].reshape(count, *designs.shape[1:]).astype(np.float32)
+
+
+def niche_capacities(count: int, niche_count: int) -> list[int]:
+    """Split a count as evenly as possible across niches."""
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
+    if niche_count <= 0:
+        raise ValueError(f"niche_count must be positive, got {niche_count}")
+    base = count // niche_count
+    remainder = count % niche_count
+    capacities = [base + (1 if idx < remainder else 0) for idx in range(niche_count)]
+    if min(capacities) <= 0:
+        raise ValueError(
+            f"niche_count must not exceed count, got {niche_count} for count={count}"
+        )
+    return capacities
+
+
+def binary_cluster_hamming_stats(
+    designs: np.ndarray,
+    labels: np.ndarray,
+) -> dict[str, float]:
+    """Measure within-cluster and between-cluster Hamming distances."""
+    flat = np.asarray(designs >= 0.5).reshape(designs.shape[0], -1)
+    labels = np.asarray(labels, dtype=np.int32).reshape(-1)
+    if flat.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"labels length must match designs, got {labels.shape[0]} and {flat.shape[0]}"
+        )
+    if flat.shape[0] < 2:
+        return {
+            "cluster_internal_mean_hamming": 0.0,
+            "cluster_external_mean_hamming": 0.0,
+            "cluster_separation_margin": 0.0,
+            "cluster_internal_min_hamming": 0.0,
+            "cluster_external_min_hamming": 0.0,
+        }
+    distances = (flat[:, None, :] != flat[None, :, :]).mean(axis=-1)
+    triu = np.triu_indices(flat.shape[0], k=1)
+    same = labels[:, None] == labels[None, :]
+    internal = distances[triu][same[triu]]
+    external = distances[triu][~same[triu]]
+    internal_mean = float(internal.mean()) if internal.size else 0.0
+    external_mean = float(external.mean()) if external.size else 0.0
+    internal_min = float(internal.min()) if internal.size else 0.0
+    external_min = float(external.min()) if external.size else 0.0
+    return {
+        "cluster_internal_mean_hamming": internal_mean,
+        "cluster_external_mean_hamming": external_mean,
+        "cluster_separation_margin": external_mean - internal_mean,
+        "cluster_internal_min_hamming": internal_min,
+        "cluster_external_min_hamming": external_min,
+    }
+
+
+def select_clustered_binary_designs_numpy(
+    designs: np.ndarray,
+    *,
+    count: int,
+    niche_count: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Select binary designs grouped into balanced Hamming-distance niches."""
+    capacities = niche_capacities(count, niche_count)
+    flat = np.asarray(designs >= 0.5).reshape(designs.shape[0], -1)
+    _unique_flat, unique_idx = np.unique(flat, axis=0, return_index=True)
+    candidate_idx = np.sort(unique_idx)
+    candidates = flat[candidate_idx]
+    if candidates.shape[0] < count:
+        raise ValueError(
+            "random blob initializer produced fewer unique designs than required: "
+            f"{candidates.shape[0]} < {count}. Increase --initial_blob_candidate_multiplier."
+        )
+
+    medoids: list[int] = [int(rng.integers(0, candidates.shape[0]))]
+    min_dist = (candidates != candidates[medoids[0]]).mean(axis=1)
+    for _ in range(1, niche_count):
+        min_dist[medoids] = -1.0
+        next_medoid = int(np.argmax(min_dist))
+        medoids.append(next_medoid)
+        new_dist = (candidates != candidates[next_medoid]).mean(axis=1)
+        min_dist = np.minimum(min_dist, new_dist)
+
+    distance_to_medoids = np.stack(
+        [(candidates != candidates[medoid]).mean(axis=1) for medoid in medoids],
+        axis=1,
+    )
+    selected_indices: list[int] = []
+    selected_labels: list[int] = []
+    used = np.zeros(candidates.shape[0], dtype=bool)
+    for niche_idx, capacity in enumerate(capacities):
+        order = np.argsort(distance_to_medoids[:, niche_idx])
+        chosen = []
+        for idx in order:
+            idx = int(idx)
+            if used[idx]:
+                continue
+            chosen.append(idx)
+            used[idx] = True
+            if len(chosen) >= capacity:
+                break
+        if len(chosen) < capacity:
+            raise ValueError(
+                f"Could not fill niche {niche_idx}: selected {len(chosen)} of {capacity}"
+            )
+        selected_indices.extend(chosen)
+        selected_labels.extend([niche_idx] * len(chosen))
+
+    selected = (
+        candidates[selected_indices]
+        .reshape(count, *designs.shape[1:])
+        .astype(np.float32)
+    )
+    labels = np.asarray(selected_labels, dtype=np.int32)
+    stats = binary_cluster_hamming_stats(selected, labels)
+    medoid_distances = np.asarray(
+        [
+            (candidates[a] != candidates[b]).mean()
+            for i, a in enumerate(medoids)
+            for b in medoids[i + 1 :]
+        ],
+        dtype=np.float64,
+    )
+    stats["cluster_medoid_min_hamming"] = (
+        float(medoid_distances.min()) if medoid_distances.size else 0.0
+    )
+    stats["cluster_medoid_mean_hamming"] = (
+        float(medoid_distances.mean()) if medoid_distances.size else 0.0
+    )
+    return selected, labels, stats
+
+
+def sorted_material_scores_from_binary_designs_numpy(
+    designs: np.ndarray,
+    *,
+    rng: np.random.Generator,
+    margin: float,
+    noise: float,
+) -> np.ndarray:
+    """Encode binary masks as sorted-material score vectors."""
+    if margin <= 0:
+        raise ValueError(f"initial_blob_score_margin must be positive, got {margin}")
+    if noise < 0:
+        raise ValueError(f"initial_blob_score_noise must be non-negative, got {noise}")
+    flat = np.asarray(designs, dtype=np.float32).reshape(designs.shape[0], -1)
+    scores = np.where(flat >= 0.5, margin, -margin).astype(np.float32)
+    if noise > 0:
+        scores += noise * rng.standard_normal(size=scores.shape).astype(np.float32)
+    return scores
+
+
+def make_sorted_material_blob_seed_codes(
+    count: int,
+    *,
+    nely: int,
+    nelx: int,
+    target_mean: float,
+    seed: int,
+    blob_count_min: int,
+    blob_count_max: int,
+    radius_min: float,
+    radius_max: float,
+    score_margin: float,
+    score_noise: float,
+    candidate_multiplier: int,
+    min_hamming: float,
+    cluster_niche_count: int = 1,
+) -> tuple[np.ndarray, dict[str, float], np.ndarray]:
+    if candidate_multiplier < 1:
+        raise ValueError(
+            "initial_blob_candidate_multiplier must be >= 1, got "
+            f"{candidate_multiplier}"
+        )
+    rng = np.random.default_rng(seed)
+    candidate_count = max(count, count * candidate_multiplier)
+    designs = random_blob_designs_numpy(
+        candidate_count,
+        nely=nely,
+        nelx=nelx,
+        target_mean=target_mean,
+        rng=rng,
+        blob_count_min=blob_count_min,
+        blob_count_max=blob_count_max,
+        radius_min=radius_min,
+        radius_max=radius_max,
+    )
+    if cluster_niche_count > 1:
+        selected, labels, cluster_stats = select_clustered_binary_designs_numpy(
+            designs,
+            count=count,
+            niche_count=cluster_niche_count,
+            rng=rng,
+        )
+    else:
+        selected = select_diverse_binary_designs_numpy(
+            designs,
+            count=count,
+            rng=rng,
+            min_hamming=min_hamming,
+        )
+        labels = np.zeros(count, dtype=np.int32)
+        cluster_stats = {}
+    if selected.shape[0] < count:
+        raise ValueError(
+            "random blob initializer produced fewer unique designs than required: "
+            f"{selected.shape[0]} < {count}. Increase --initial_blob_candidate_multiplier."
+        )
+    stats = {
+        "candidate_count": float(candidate_count),
+        "selected_count": float(selected.shape[0]),
+        "mean_pairwise_hamming": mean_pairwise_hamming_numpy(selected),
+        "min_pairwise_hamming": min_pairwise_hamming_numpy(selected),
+        "cluster_niche_count": float(cluster_niche_count),
+        **cluster_stats,
+    }
+    scores = sorted_material_scores_from_binary_designs_numpy(
+        selected,
+        rng=rng,
+        margin=score_margin,
+        noise=score_noise,
+    )
+    return scores, stats, labels
 
 
 def rasterize_bar_primitives_numpy(
@@ -1052,9 +1695,15 @@ def parse_ladder_sequence(specs: list[str]) -> tuple[tuple[LadderKind, float], .
             )
         kind_raw, value_raw = spec.split(":", 1)
         kind = kind_raw.strip().lower()
-        if kind not in {"volume", "compliance", "roughness", "connectivity"}:
+        if kind not in {
+            "volume",
+            "compliance",
+            "roughness",
+            "connectivity",
+            "diversity",
+        }:
             raise ValueError(
-                f"Invalid ladder kind '{kind_raw}'. Expected one of volume, compliance, roughness, connectivity"
+                f"Invalid ladder kind '{kind_raw}'. Expected one of volume, compliance, roughness, connectivity, diversity"
             )
         parsed.append((kind, float(value_raw)))
     return tuple(parsed)
@@ -1062,7 +1711,7 @@ def parse_ladder_sequence(specs: list[str]) -> tuple[tuple[LadderKind, float], .
 
 def parse_levels_ladder_specs(specs: list[str]) -> list[Rung]:
     """Parse official Levels.ladder specs like compliance:130,110,100."""
-    allowed = {"volume", "roughness", "compliance", "connectivity"}
+    allowed = {"volume", "roughness", "compliance", "connectivity", "diversity"}
     rungs: list[Rung] = []
     for spec in specs:
         parts = [part.strip() for part in spec.split(":")]
@@ -1096,6 +1745,7 @@ def get_level_names(
     compliance_ladder: list[float],
     roughness_ladder: list[float],
     connectivity_ladder: list[float],
+    diversity_ladder: list[float],
     connectivity_max: float | None,
     ladder_sequence: tuple[tuple[LadderKind, float], ...],
 ) -> list[str]:
@@ -1112,6 +1762,7 @@ def get_level_names(
         names.extend(
             f"connectivity_violation_le_{bound:g}" for bound in connectivity_ladder
         )
+        names.extend(f"diversity_violation_ge_{bound:g}" for bound in diversity_ladder)
     if connectivity_max is not None:
         names.append("connectivity_violation")
     names.extend(["volume_violation", "roughness_violation", "compliance"])
@@ -1174,6 +1825,13 @@ class FEMCantileverEvaluator:
         self.fixed_dofs, self.free_dofs = self._build_boundary_conditions()
         self.n_free_dofs = int(len(self.free_dofs))
         self._precompute_free_stiffness_entries()
+        self._mf_cache_key: tuple[str, torch.dtype] | None = None
+        self._mf_edof: torch.Tensor | None = None
+        self._mf_free_dofs: torch.Tensor | None = None
+        self._mf_ke: torch.Tensor | None = None
+        self._mf_force_free: torch.Tensor | None = None
+        self.last_matrix_free_cg_iterations: np.ndarray | None = None
+        self.last_matrix_free_cg_relative_residuals: np.ndarray | None = None
         self.force_cases = self._active_force_cases()
         self.forces = tuple(
             self._build_force_vector_for_case(load_case)
@@ -1189,6 +1847,19 @@ class FEMCantileverEvaluator:
             profile=self.config.sorted_material_profile,
             steepness=self.config.sorted_material_steepness,
         )
+        self.diversity_reference_designs: np.ndarray | None = None
+        self.solid_compliance = self._compute_solid_compliance()
+
+    def set_density_filter_radius(self, radius: int) -> None:
+        """Update the density filter kernel used by subsequent decodes."""
+        if radius < 0:
+            raise ValueError(
+                f"density_filter_radius must be non-negative, got {radius}"
+            )
+        if radius == self.config.density_filter_radius:
+            return
+        self.config.density_filter_radius = radius
+        self.filter_offsets, self.filter_weights = self._build_filter_kernel()
         self.solid_compliance = self._compute_solid_compliance()
 
     def close(self) -> None:
@@ -1565,6 +2236,155 @@ class FEMCantileverEvaluator:
         compliances = np.sum(rhs * displacements, axis=0).astype(np.float64).tolist()
         return self._aggregate_compliances(compliances)
 
+    def _ensure_matrix_free_tensors(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        dtype = matrix_free_cg_torch_dtype(self.config.matrix_free_cg_dtype)
+        device = torch.device(self.config.matrix_free_cg_device)
+        key = (str(device), dtype)
+        if self._mf_cache_key != key:
+            self._mf_edof = torch.as_tensor(
+                self.edof_mat.astype(np.int64),
+                device=device,
+            )
+            self._mf_free_dofs = torch.as_tensor(
+                self.free_dofs.astype(np.int64),
+                device=device,
+            )
+            self._mf_ke = torch.as_tensor(self.ke, device=device, dtype=dtype)
+            self._mf_force_free = torch.as_tensor(
+                self.force_free,
+                device=device,
+                dtype=dtype,
+            )
+            self._mf_cache_key = key
+        if (
+            self._mf_edof is None
+            or self._mf_free_dofs is None
+            or self._mf_ke is None
+            or self._mf_force_free is None
+        ):
+            raise RuntimeError("matrix-free tensor cache was not initialized")
+        return self._mf_edof, self._mf_free_dofs, self._mf_ke, self._mf_force_free
+
+    def _matrix_free_matvec(
+        self,
+        x_free: torch.Tensor,
+        moduli: torch.Tensor,
+    ) -> torch.Tensor:
+        edof, free_dofs, ke, _force_free = self._ensure_matrix_free_tensors()
+        batch_size = x_free.shape[0]
+        x_global = torch.zeros(
+            (batch_size, self.ndof),
+            device=x_free.device,
+            dtype=x_free.dtype,
+        )
+        x_global[:, free_dofs] = x_free
+        x_elem = x_global[:, edof]
+        kx_elem = torch.einsum("ij,bej->bei", ke, x_elem)
+        kx_elem = kx_elem * moduli[:, :, None]
+        out_global = torch.zeros_like(x_global)
+        scatter_index = edof.reshape(1, -1).expand(batch_size, -1)
+        out_global.scatter_add_(1, scatter_index, kx_elem.reshape(batch_size, -1))
+        return out_global[:, free_dofs]
+
+    def _matrix_free_jacobi_diagonal(self, moduli: torch.Tensor) -> torch.Tensor:
+        edof, free_dofs, ke, _force_free = self._ensure_matrix_free_tensors()
+        batch_size = moduli.shape[0]
+        elem_diag = torch.diagonal(ke).reshape(1, 1, -1) * moduli[:, :, None]
+        diag_global = torch.zeros(
+            (batch_size, self.ndof),
+            device=moduli.device,
+            dtype=moduli.dtype,
+        )
+        scatter_index = edof.reshape(1, -1).expand(batch_size, -1)
+        diag_global.scatter_add_(1, scatter_index, elem_diag.reshape(batch_size, -1))
+        return torch.clamp(diag_global[:, free_dofs], min=1e-30)
+
+    def _solve_compliance_matrix_free_batch(self, samples: np.ndarray) -> np.ndarray:
+        if len(self.force_frees) != 1:
+            raise ValueError(
+                "--compliance_solver matrix_free_cg currently supports one load case"
+            )
+        _edof, _free_dofs, _ke, force_free = self._ensure_matrix_free_tensors()
+        with torch.no_grad():
+            densities = torch.as_tensor(
+                np.asarray(samples, dtype=np.float64),
+                device=force_free.device,
+                dtype=force_free.dtype,
+            ).reshape(-1, self.nely, self.nelx)
+            batch_size = densities.shape[0]
+            moduli = self.config.e_min + (
+                densities.reshape(batch_size, -1).pow(self.config.simp_p)
+                * (self.config.e_max - self.config.e_min)
+            )
+            b = force_free.reshape(1, -1).expand(batch_size, -1)
+            b_norm = torch.clamp(torch.linalg.vector_norm(b, dim=1), min=1e-30)
+            x = torch.zeros_like(b)
+            r = b.clone()
+            diag = self._matrix_free_jacobi_diagonal(moduli)
+            z = r / diag
+            p = z.clone()
+            rz = torch.sum(r * z, dim=1)
+            rel = torch.linalg.vector_norm(r, dim=1) / b_norm
+            iterations = torch.zeros(
+                batch_size,
+                device=force_free.device,
+                dtype=torch.int64,
+            )
+            active = rel > self.config.matrix_free_cg_tol
+
+            for step in range(1, self.config.matrix_free_cg_max_iter + 1):
+                if not bool(torch.any(active).item()):
+                    break
+                if p.device.type == "mps":
+                    ap = self._matrix_free_matvec(p, moduli)
+                else:
+                    active_idx = torch.nonzero(active, as_tuple=False).flatten()
+                    ap = torch.zeros_like(p)
+                    ap_active = self._matrix_free_matvec(
+                        p.index_select(0, active_idx),
+                        moduli.index_select(0, active_idx),
+                    )
+                    ap.index_copy_(0, active_idx, ap_active)
+                denom = torch.clamp(torch.sum(p * ap, dim=1), min=1e-30)
+                alpha = torch.where(active, rz / denom, torch.zeros_like(rz))
+                x_next = x + alpha[:, None] * p
+                r_next = r - alpha[:, None] * ap
+                z_next = r_next / diag
+                rz_next = torch.sum(r_next * z_next, dim=1)
+                beta = torch.where(
+                    active,
+                    rz_next / torch.clamp(rz, min=1e-30),
+                    torch.zeros_like(rz),
+                )
+                p_next = z_next + beta[:, None] * p
+
+                active_col = active[:, None]
+                x = torch.where(active_col, x_next, x)
+                r = torch.where(active_col, r_next, r)
+                z = torch.where(active_col, z_next, z)
+                p = torch.where(active_col, p_next, p)
+                rz = torch.where(active, rz_next, rz)
+                rel = torch.linalg.vector_norm(r, dim=1) / b_norm
+                newly_converged = active & (rel <= self.config.matrix_free_cg_tol)
+                iterations = torch.where(
+                    newly_converged,
+                    torch.full_like(iterations, step),
+                    iterations,
+                )
+                active = active & (rel > self.config.matrix_free_cg_tol)
+
+            iterations = torch.where(
+                iterations == 0,
+                torch.full_like(iterations, self.config.matrix_free_cg_max_iter),
+                iterations,
+            )
+            compliances = torch.sum(b * x, dim=1)
+            self.last_matrix_free_cg_iterations = iterations.cpu().numpy()
+            self.last_matrix_free_cg_relative_residuals = rel.cpu().numpy()
+            return compliances.cpu().numpy().astype(np.float64, copy=False)
+
     def _finalize_density_sample(self, sample_raw: np.ndarray) -> np.ndarray:
         sample = self._apply_density_filter(sample_raw.astype(np.float64, copy=False))
         return apply_projection_numpy(
@@ -1815,9 +2635,53 @@ class FEMCantileverEvaluator:
                     stack.append((nr, nc))
         return float(max(total_solid - connected, 0) / total_solid)
 
+    def _boundary_points_numpy(self, sample: np.ndarray) -> np.ndarray:
+        solid = sample >= self.config.projection_eta
+        if not np.any(solid):
+            return np.asarray([[0.5, 0.5]], dtype=np.float32)
+
+        padded = np.pad(solid, 1, constant_values=False)
+        boundary = solid & (
+            ~padded[:-2, 1:-1]
+            | ~padded[2:, 1:-1]
+            | ~padded[1:-1, :-2]
+            | ~padded[1:-1, 2:]
+        )
+        points = np.argwhere(boundary)
+        if points.size == 0:
+            points = np.argwhere(solid)
+        max_points = self.config.diversity_chamfer_max_points
+        if points.shape[0] > max_points:
+            idx = np.linspace(0, points.shape[0] - 1, max_points, dtype=np.int32)
+            points = points[idx]
+        coords = np.empty((points.shape[0], 2), dtype=np.float32)
+        coords[:, 0] = (points[:, 1].astype(np.float32) + 0.5) / float(self.nelx)
+        coords[:, 1] = (points[:, 0].astype(np.float32) + 0.5) / float(self.nely)
+        return coords
+
+    @staticmethod
+    def _chamfer_distance_numpy(a: np.ndarray, b: np.ndarray) -> float:
+        diff = a[:, None, :] - b[None, :, :]
+        dist2 = np.sum(diff * diff, axis=-1)
+        return float(
+            np.sqrt(np.min(dist2, axis=1)).mean()
+            + np.sqrt(np.min(dist2, axis=0)).mean()
+        )
+
+    def boundary_chamfer_diversity(self, sample: np.ndarray) -> float:
+        refs = self.diversity_reference_designs
+        if refs is None or len(refs) == 0:
+            return float("inf")
+        sample_points = self._boundary_points_numpy(sample)
+        best = float("inf")
+        for reference in refs:
+            ref_points = self._boundary_points_numpy(reference)
+            best = min(best, self._chamfer_distance_numpy(sample_points, ref_points))
+        return best
+
     def density_objectives(
         self, sample: np.ndarray
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         volume = float(sample.mean())
         dx = float(np.abs(sample[:, 1:] - sample[:, :-1]).mean())
         dy = float(np.abs(sample[1:, :] - sample[:-1, :]).mean())
@@ -1827,8 +2691,18 @@ class FEMCantileverEvaluator:
             if self.requires_connectivity
             else 0.0
         )
+        diversity = (
+            self.boundary_chamfer_diversity(sample)
+            if self.config.diversity_ladder
+            or any(kind == "diversity" for kind, _bound in self.config.ladder_sequence)
+            or (
+                self.config.use_levels_ladder
+                and "diversity" in self.config.levels_ladder_objectives
+            )
+            else float("inf")
+        )
         compliance = self._solve_compliance(sample)
-        return volume, roughness, connectivity, compliance
+        return volume, roughness, connectivity, diversity, compliance
 
     def removal_ladder_objectives(self, scores: np.ndarray) -> list[float]:
         flat_scores = np.asarray(scores, dtype=np.float64).reshape(-1)
@@ -1883,13 +2757,19 @@ class FEMCantileverEvaluator:
         return values
 
     def _format_objective_values(
-        self, volume: float, roughness: float, connectivity: float, compliance: float
+        self,
+        volume: float,
+        roughness: float,
+        connectivity: float,
+        diversity: float,
+        compliance: float,
     ) -> list[float]:
         if self.config.use_levels_ladder:
             objective_values = {
                 "volume": volume,
                 "roughness": roughness,
                 "connectivity": connectivity,
+                "diversity": diversity,
                 "compliance": compliance,
             }
             return [
@@ -1907,6 +2787,8 @@ class FEMCantileverEvaluator:
                     level_values.append(max(roughness - bound, 0.0))
                 elif kind == "connectivity":
                     level_values.append(max(connectivity - bound, 0.0))
+                elif kind == "diversity":
+                    level_values.append(max(bound - diversity, 0.0))
                 else:
                     raise ValueError(f"Unknown ladder kind: {kind}")
         else:
@@ -1918,6 +2800,8 @@ class FEMCantileverEvaluator:
                 level_values.append(max(roughness - bound, 0.0))
             for bound in self.config.connectivity_ladder:
                 level_values.append(max(connectivity - bound, 0.0))
+            for bound in self.config.diversity_ladder:
+                level_values.append(max(bound - diversity, 0.0))
         if self.config.connectivity_max is not None:
             level_values.append(max(connectivity - self.config.connectivity_max, 0.0))
         level_values.extend(
@@ -1931,14 +2815,48 @@ class FEMCantileverEvaluator:
 
     def evaluate_densities_numpy(self, x_phys: np.ndarray) -> list[list[float]]:
         samples = np.asarray(x_phys, dtype=np.float64).reshape(-1, self.nely, self.nelx)
-        if self.config.fem_workers <= 1 or len(samples) <= 1:
+        if self.config.compliance_solver == "matrix_free_cg":
+            compliances = self._solve_compliance_matrix_free_batch(samples)
+            objectives = [
+                (
+                    float(sample.mean()),
+                    0.5
+                    * (
+                        float(np.abs(sample[:, 1:] - sample[:, :-1]).mean())
+                        + float(np.abs(sample[1:, :] - sample[:-1, :]).mean())
+                    ),
+                    self.disconnected_solid_fraction(sample)
+                    if self.requires_connectivity
+                    else 0.0,
+                    self.boundary_chamfer_diversity(sample)
+                    if self.config.diversity_ladder
+                    or any(
+                        kind == "diversity"
+                        for kind, _bound in self.config.ladder_sequence
+                    )
+                    or (
+                        self.config.use_levels_ladder
+                        and "diversity" in self.config.levels_ladder_objectives
+                    )
+                    else float("inf"),
+                    float(compliance),
+                )
+                for sample, compliance in zip(samples, compliances, strict=True)
+            ]
+        elif self.config.fem_workers <= 1 or len(samples) <= 1:
             objectives = [self.density_objectives(sample) for sample in samples]
         else:
             pool = self._get_fem_executor()
             objectives = list(pool.map(self.density_objectives, samples))
         return [
-            self._format_objective_values(volume, roughness, connectivity, compliance)
-            for volume, roughness, connectivity, compliance in objectives
+            self._format_objective_values(
+                volume,
+                roughness,
+                connectivity,
+                diversity,
+                compliance,
+            )
+            for volume, roughness, connectivity, diversity, compliance in objectives
         ]
 
     def evaluate_removal_ladder_numpy(self, x_np: np.ndarray) -> list[list[float]]:
@@ -1993,6 +2911,7 @@ class TorchFEMCantileverEvaluator(FEMCantileverEvaluator):
             profile=self.config.sorted_material_profile,
             steepness=self.config.sorted_material_steepness,
         )
+        self.diversity_reference_designs: np.ndarray | None = None
         self.solid_compliance = self._compute_solid_compliance()
         torch.set_default_dtype(prev_dtype)
 
@@ -2025,6 +2944,38 @@ class TorchFEMCantileverEvaluator(FEMCantileverEvaluator):
         u, f, _, _, _ = model.solve(method="spsolve")
         torch.set_default_dtype(prev_dtype)
         return float(torch.inner(f.ravel(), u.ravel()).item())
+
+
+class BufferChamferDiversityObjective:
+    """Callable objective that refreshes Chamfer references from the elite buffer."""
+
+    def __init__(self, evaluator: FEMCantileverEvaluator, buffer: Buffer) -> None:
+        self.evaluator = evaluator
+        self.buffer = buffer
+
+    def _refresh_references(self) -> None:
+        cfg = self.evaluator.config
+        needs_diversity = (
+            bool(cfg.diversity_ladder)
+            or any(kind == "diversity" for kind, _bound in cfg.ladder_sequence)
+            or (cfg.use_levels_ladder and "diversity" in cfg.levels_ladder_objectives)
+        )
+        if not needs_diversity or len(self.buffer) == 0:
+            self.evaluator.diversity_reference_designs = None
+            return
+        k = min(cfg.diversity_reference_size, len(self.buffer))
+        tensors = self.buffer.get_top_k(k).detach().cpu().numpy()
+        self.evaluator.diversity_reference_designs = (
+            self.evaluator.decode_designs_numpy(tensors)
+        )
+
+    def evaluate_densities_numpy(self, x_phys: np.ndarray) -> list[list[float]]:
+        self._refresh_references()
+        return self.evaluator.evaluate_densities_numpy(x_phys)
+
+    def __call__(self, theta: torch.Tensor | np.ndarray) -> list[list[float]]:
+        self._refresh_references()
+        return self.evaluator(theta)
 
 
 def pairwise_l2_mean(designs: torch.Tensor) -> float:
@@ -2151,6 +3102,757 @@ class DiverseEliteBuffer:
         return getattr(self.inner, name)
 
 
+class NicheEliteBuffer:
+    """Split elites across design-space niches while exposing the Buffer API."""
+
+    def __init__(
+        self,
+        *,
+        buffer_size: int,
+        value_levels: Levels,
+        niche_count: int,
+        design_proxy: DesignProxyFn,
+        min_hamming: float,
+        view_mode: Literal["balanced", "global"] = "balanced",
+        cross_niche_min_hamming: float = 0.0,
+        cross_niche_reference_top_k: int = 1,
+    ) -> None:
+        if buffer_size <= 0:
+            raise ValueError(f"buffer_size must be positive, got {buffer_size}")
+        if niche_count < 2:
+            raise ValueError(f"niche_count must be >= 2, got {niche_count}")
+        if not 0.0 <= min_hamming <= 1.0:
+            raise ValueError(f"min_hamming must be in [0, 1], got {min_hamming}")
+        if not 0.0 <= cross_niche_min_hamming <= 1.0:
+            raise ValueError(
+                "cross_niche_min_hamming must be in [0, 1], got "
+                f"{cross_niche_min_hamming}"
+            )
+        if cross_niche_reference_top_k <= 0:
+            raise ValueError(
+                "cross_niche_reference_top_k must be positive, got "
+                f"{cross_niche_reference_top_k}"
+            )
+        if view_mode not in {"balanced", "global"}:
+            raise ValueError(f"Unknown niche buffer view_mode: {view_mode}")
+        self.buffer_size = buffer_size
+        self.value_levels = value_levels
+        self.niche_count = niche_count
+        self.design_proxy = design_proxy
+        self.min_hamming = min_hamming
+        self.view_mode = view_mode
+        self.cross_niche_min_hamming = cross_niche_min_hamming
+        self.cross_niche_reference_top_k = cross_niche_reference_top_k
+        base_capacity = buffer_size // niche_count
+        remainder = buffer_size % niche_count
+        self.niche_capacities = [
+            base_capacity + (1 if idx < remainder else 0) for idx in range(niche_count)
+        ]
+        if min(self.niche_capacities) <= 0:
+            raise ValueError(
+                "niche_count must not exceed buffer_size, got "
+                f"{niche_count} niches for buffer_size={buffer_size}"
+            )
+        self.buffers = [
+            Buffer(buffer_size=capacity, value_levels=value_levels)
+            for capacity in self.niche_capacities
+        ]
+        self.niche_anchor_proxies: list[torch.Tensor | None] = [
+            None for _ in range(niche_count)
+        ]
+        self._pending_initial_niche_labels: list[int] = []
+
+    def queue_initial_niche_labels(self, labels: np.ndarray | list[int]) -> None:
+        """Use fixed niche labels for the next insertions, typically init seeds."""
+        label_list = [int(label) for label in np.asarray(labels).reshape(-1)]
+        for label in label_list:
+            if label < 0 or label >= self.niche_count:
+                raise ValueError(
+                    f"initial niche label must be in [0, {self.niche_count}), got {label}"
+                )
+        self._pending_initial_niche_labels = label_list
+
+    def _consume_initial_niche_labels(self, count: int) -> list[int] | None:
+        if not self._pending_initial_niche_labels:
+            return None
+        if len(self._pending_initial_niche_labels) < count:
+            raise ValueError(
+                "Not enough queued initial niche labels for insertion: "
+                f"{len(self._pending_initial_niche_labels)} < {count}"
+            )
+        labels = self._pending_initial_niche_labels[:count]
+        self._pending_initial_niche_labels = self._pending_initial_niche_labels[count:]
+        return labels
+
+    def _normalize_many_values(
+        self,
+        tensors: list[torch.Tensor],
+        values: list[float] | list[list[float]],
+    ) -> list[float | list[float] | tuple[float, ...]]:
+        return self.buffers[0]._normalize_many_values(tensors, values)
+
+    @staticmethod
+    def _value_row(value: float | list[float] | tuple[float, ...]) -> list[float]:
+        if isinstance(value, list | tuple):
+            return [float(v) for v in value]
+        return [float(value)]
+
+    def _proxy(self, tensors: list[torch.Tensor]) -> torch.Tensor:
+        if not tensors:
+            return torch.empty((0, 0), dtype=torch.bool)
+        batch = torch.stack([tensor.detach().cpu() for tensor in tensors])
+        proxy = self.design_proxy(batch)
+        if proxy.shape[0] != len(tensors):
+            raise ValueError(
+                "niche design_proxy must return one proxy per tensor, got "
+                f"{proxy.shape[0]} for {len(tensors)}"
+            )
+        return proxy.reshape(proxy.shape[0], -1).to(torch.bool).cpu()
+
+    def _current_entries(self) -> list[tuple[list[float], torch.Tensor]]:
+        entries: list[tuple[list[float], torch.Tensor]] = []
+        for buffer in self.buffers:
+            entries.extend(
+                ([float(v) for v in value], buffer.get(idx).detach().clone())
+                for idx, value in enumerate(buffer.get_sorted_values())
+            )
+        return entries
+
+    @staticmethod
+    def _hamming_distance(
+        proxy: torch.Tensor, references: torch.Tensor
+    ) -> torch.Tensor:
+        return (references != proxy).to(torch.float32).mean(dim=1)
+
+    def _set_anchor_if_missing(
+        self,
+        niche_idx: int,
+        proxy: torch.Tensor,
+    ) -> None:
+        if self.niche_anchor_proxies[niche_idx] is None:
+            self.niche_anchor_proxies[niche_idx] = proxy.detach().clone().to(torch.bool)
+
+    def _anchor_tensor(self) -> tuple[list[int], torch.Tensor]:
+        indices: list[int] = []
+        anchors: list[torch.Tensor] = []
+        for idx, proxy in enumerate(self.niche_anchor_proxies):
+            if proxy is None:
+                continue
+            indices.append(idx)
+            anchors.append(proxy)
+        if not anchors:
+            return [], torch.empty((0, 0), dtype=torch.bool)
+        return indices, torch.stack(anchors)
+
+    def _ensure_anchors_from_candidates(
+        self,
+        entries: list[tuple[list[float], torch.Tensor]],
+        proxies: torch.Tensor,
+    ) -> None:
+        """Seed missing niche anchors from ranked candidates without moving entries."""
+        if proxies.shape[0] == 0:
+            return
+        ranked_positions = sorted(
+            range(len(entries)), key=lambda idx: tuple(entries[idx][0])
+        )
+        used_positions: set[int] = set()
+        for niche_idx in range(self.niche_count):
+            if self.niche_anchor_proxies[niche_idx] is not None:
+                continue
+
+            _anchor_indices, anchors = self._anchor_tensor()
+            if anchors.numel() == 0:
+                chosen = ranked_positions[0]
+            else:
+                candidate_scores: list[tuple[float, int]] = []
+                for pos in ranked_positions:
+                    if pos in used_positions:
+                        continue
+                    distance = self._hamming_distance(proxies[pos], anchors).min()
+                    candidate_scores.append((float(distance.item()), pos))
+                if not candidate_scores:
+                    break
+                _distance, chosen = max(candidate_scores, key=lambda item: item[0])
+
+            used_positions.add(chosen)
+            self._set_anchor_if_missing(niche_idx, proxies[chosen])
+
+    def _assign_niche_indices(
+        self,
+        entries: list[tuple[list[float], torch.Tensor]],
+    ) -> list[int]:
+        proxies = self._proxy([tensor for _value, tensor in entries])
+        self._ensure_anchors_from_candidates(entries, proxies)
+        anchor_indices, anchors = self._anchor_tensor()
+        if anchors.numel() == 0:
+            return [0 for _ in entries]
+
+        labels: list[int] = []
+        for proxy in proxies:
+            distances = self._hamming_distance(proxy, anchors)
+            nearest_anchor = int(torch.argmin(distances).item())
+            labels.append(anchor_indices[nearest_anchor])
+        return labels
+
+    def _select_representatives(self, proxies: torch.Tensor) -> list[int]:
+        selected: list[int] = []
+        selected_mask = torch.zeros(proxies.shape[0], dtype=torch.bool)
+        for idx in range(proxies.shape[0]):
+            if not selected:
+                selected.append(idx)
+                selected_mask[idx] = True
+                continue
+            distances = self._hamming_distance(proxies[idx], proxies[selected])
+            if float(distances.min().item()) >= self.min_hamming:
+                selected.append(idx)
+                selected_mask[idx] = True
+            if len(selected) >= self.niche_count:
+                return selected
+
+        while len(selected) < min(self.niche_count, proxies.shape[0]):
+            if not selected:
+                break
+            distances_to_selected = torch.stack(
+                [
+                    self._hamming_distance(proxies[idx], proxies[selected]).min()
+                    for idx in range(proxies.shape[0])
+                ]
+            )
+            distances_to_selected[selected_mask] = -1.0
+            next_idx = int(torch.argmax(distances_to_selected).item())
+            if bool(selected_mask[next_idx]):
+                break
+            selected.append(next_idx)
+            selected_mask[next_idx] = True
+        return selected
+
+    def _rebuild(self, entries: list[tuple[list[float], torch.Tensor]]) -> None:
+        entries.sort(key=lambda entry: tuple(entry[0]))
+        if not entries:
+            for buffer in self.buffers:
+                buffer.clear()
+            return
+        proxies = self._proxy([tensor for _value, tensor in entries])
+        representatives = self._select_representatives(proxies)
+        niche_indices: list[list[int]] = [[] for _ in range(self.niche_count)]
+        if not representatives:
+            representatives = [0]
+        rep_proxies = proxies[representatives]
+        for idx in range(len(entries)):
+            distances = self._hamming_distance(proxies[idx], rep_proxies)
+            niche_idx = int(torch.argmin(distances).item())
+            niche_indices[niche_idx].append(idx)
+
+        selected_by_niche: list[list[int]] = []
+        selected: set[int] = set()
+        for capacity, indices in zip(self.niche_capacities, niche_indices, strict=True):
+            local_selected = indices[:capacity]
+            selected_by_niche.append(local_selected)
+            selected.update(local_selected)
+
+        # If nearest-representative assignment is imbalanced, fill underfull niches
+        # from ranked overflow rather than silently shrinking the total buffer.
+        unused = [idx for idx in range(len(entries)) if idx not in selected]
+        unused_position = 0
+        for niche_idx, capacity in enumerate(self.niche_capacities):
+            need = capacity - len(selected_by_niche[niche_idx])
+            if need <= 0:
+                continue
+            fill = unused[unused_position : unused_position + need]
+            unused_position += len(fill)
+            selected_by_niche[niche_idx].extend(fill)
+
+        for buffer, capacity, indices_for_niche in zip(
+            self.buffers,
+            self.niche_capacities,
+            selected_by_niche,
+            strict=True,
+        ):
+            buffer.clear()
+            indices_for_niche = indices_for_niche[:capacity]
+            if indices_for_niche:
+                selected_entries = [entries[idx] for idx in indices_for_niche]
+                buffer.insert_many(
+                    tensors=[tensor for _value, tensor in selected_entries],
+                    values=[value for value, _tensor in selected_entries],
+                )
+
+    def reset_anchors_from_current_tops(self) -> None:
+        """Refresh niche anchors from the current best entry in each niche."""
+        self.niche_anchor_proxies = [None for _ in range(self.niche_count)]
+        for niche_idx, buffer in enumerate(self.buffers):
+            if len(buffer) == 0:
+                continue
+            top = buffer.get_top_k(1)
+            tensor = top[0] if top.ndim > 1 else top
+            proxy = self._proxy([tensor])[0]
+            self._set_anchor_if_missing(niche_idx, proxy)
+
+    def rebuild_from_entries(
+        self,
+        entries: list[tuple[list[float], torch.Tensor]],
+    ) -> None:
+        """Rebuild all niche sub-buffers from already-evaluated entries."""
+        self._rebuild(entries)
+        self.reset_anchors_from_current_tops()
+
+    def _passes_cross_niche_distance(
+        self,
+        *,
+        niche_idx: int,
+        proxy: torch.Tensor,
+    ) -> bool:
+        if self.cross_niche_min_hamming <= 0:
+            return True
+
+        references: list[torch.Tensor] = []
+        for other_idx, buffer in enumerate(self.buffers):
+            if other_idx == niche_idx or len(buffer) == 0:
+                continue
+            k = min(self.cross_niche_reference_top_k, len(buffer))
+            top = buffer.get_top_k(k)
+            if top.ndim == 1:
+                references.append(top.detach().cpu())
+            else:
+                references.extend(row.detach().cpu() for row in top)
+        if not references:
+            return True
+
+        reference_proxies = self._proxy(references)
+        min_distance = self._hamming_distance(proxy, reference_proxies).min()
+        return float(min_distance.item()) >= self.cross_niche_min_hamming
+
+    def insert(self, tensor: torch.Tensor, value: float | list[float]) -> None:
+        self.insert_many(tensors=[tensor], values=[value])
+
+    def insert_many(
+        self,
+        tensors: list[torch.Tensor],
+        values: list[float] | list[list[float]],
+    ) -> None:
+        tensor_list = [tensor.detach().clone() for tensor in tensors]
+        normalized_values = self._normalize_many_values(tensor_list, values)
+        if len(normalized_values) != len(tensor_list):
+            raise ValueError(
+                f"Number of values ({len(normalized_values)}) does not match "
+                f"number of tensors ({len(tensor_list)})"
+            )
+        initial_labels = self._consume_initial_niche_labels(len(tensor_list))
+        if initial_labels is not None:
+            proxies = self._proxy(tensor_list)
+            for niche_idx in range(self.niche_count):
+                selected = []
+                for tensor, value, proxy, label in zip(
+                    tensor_list,
+                    normalized_values,
+                    proxies,
+                    initial_labels,
+                    strict=True,
+                ):
+                    if label != niche_idx:
+                        continue
+                    self._set_anchor_if_missing(niche_idx, proxy)
+                    selected.append((tensor, value))
+                if selected:
+                    self.buffers[niche_idx].insert_many(
+                        tensors=[tensor for tensor, _value in selected],
+                        values=[value for _tensor, value in selected],
+                    )
+            return
+        new_entries = [
+            (self._value_row(value), tensor)
+            for tensor, value in zip(tensor_list, normalized_values, strict=True)
+        ]
+        niche_labels = self._assign_niche_indices(new_entries)
+        proxies = (
+            self._proxy([tensor for _value, tensor in new_entries])
+            if self.cross_niche_min_hamming > 0
+            else None
+        )
+        for niche_idx in range(self.niche_count):
+            selected = [
+                (tensor, value)
+                for position, ((value, tensor), label) in enumerate(
+                    zip(new_entries, niche_labels, strict=True)
+                )
+                if label == niche_idx
+                and (
+                    proxies is None
+                    or self._passes_cross_niche_distance(
+                        niche_idx=niche_idx,
+                        proxy=proxies[position],
+                    )
+                )
+            ]
+            if selected:
+                self.buffers[niche_idx].insert_many(
+                    tensors=[tensor for tensor, _value in selected],
+                    values=[value for _tensor, value in selected],
+                )
+
+    def _global_entries(self) -> list[tuple[list[float], torch.Tensor]]:
+        entries = self._current_entries()
+        entries.sort(key=lambda entry: tuple(entry[0]))
+        return entries[: self.buffer_size]
+
+    def _balanced_entries(
+        self,
+        limit: int | None = None,
+    ) -> list[tuple[list[float], torch.Tensor]]:
+        per_niche_entries = []
+        for buffer in self.buffers:
+            per_niche_entries.append(
+                [
+                    ([float(v) for v in value], buffer.get(idx).detach().clone())
+                    for idx, value in enumerate(buffer.get_sorted_values())
+                ]
+            )
+        limit = self.buffer_size if limit is None else min(limit, self.buffer_size)
+        selected: list[tuple[list[float], torch.Tensor]] = []
+        local_idx = 0
+        while len(selected) < limit:
+            added = False
+            for entries in per_niche_entries:
+                if local_idx < len(entries):
+                    selected.append(entries[local_idx])
+                    added = True
+                    if len(selected) >= limit:
+                        break
+            if not added:
+                break
+            local_idx += 1
+        selected.sort(key=lambda entry: tuple(entry[0]))
+        return selected
+
+    def _view_entries(
+        self,
+        limit: int | None = None,
+    ) -> list[tuple[list[float], torch.Tensor]]:
+        if self.view_mode == "global":
+            entries = self._global_entries()
+            if limit is not None:
+                entries = entries[:limit]
+            return entries
+        return self._balanced_entries(limit=limit)
+
+    def get_sorted_values(self) -> list[list[float]]:
+        return [value for value, _tensor in self._view_entries()]
+
+    def get_niche_sorted_values(self, niche_idx: int) -> list[list[float]]:
+        if niche_idx < 0 or niche_idx >= self.niche_count:
+            raise IndexError(
+                f"niche_idx must be in [0, {self.niche_count}), got {niche_idx}"
+            )
+        return [
+            [float(v) for v in value]
+            for value in self.buffers[niche_idx].get_sorted_values()
+        ]
+
+    def get_niche_top_k(self, niche_idx: int, k: int) -> torch.Tensor:
+        if niche_idx < 0 or niche_idx >= self.niche_count:
+            raise IndexError(
+                f"niche_idx must be in [0, {self.niche_count}), got {niche_idx}"
+            )
+        k = min(max(k, 0), len(self.buffers[niche_idx]))
+        return self.buffers[niche_idx].get_top_k(k)
+
+    def get_niche_length(self, niche_idx: int) -> int:
+        if niche_idx < 0 or niche_idx >= self.niche_count:
+            raise IndexError(
+                f"niche_idx must be in [0, {self.niche_count}), got {niche_idx}"
+            )
+        return len(self.buffers[niche_idx])
+
+    def get_niche(self, niche_idx: int, idx: int) -> torch.Tensor:
+        if niche_idx < 0 or niche_idx >= self.niche_count:
+            raise IndexError(
+                f"niche_idx must be in [0, {self.niche_count}), got {niche_idx}"
+            )
+        return self.buffers[niche_idx].get(idx)
+
+    def get(self, idx: int | slice) -> torch.Tensor:
+        entries = self._view_entries()
+        if not entries:
+            raise RuntimeError("Buffer is empty")
+        if isinstance(idx, int):
+            idx %= len(entries)
+            return entries[idx][1]
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(entries))
+            tensors = [entries[pos][1] for pos in range(start, stop, step)]
+            if not tensors:
+                return entries[0][1].unsqueeze(0)[:0]
+            return torch.stack(tensors)
+        raise TypeError("Index must be int or slice")
+
+    def __getitem__(self, idx: int | slice) -> torch.Tensor:
+        return self.get(idx)
+
+    def get_top_k(self, k: int) -> torch.Tensor:
+        k = min(max(k, 0), len(self))
+        entries = self._view_entries(limit=k)
+        if not entries:
+            first_tensor = next(
+                (
+                    buffer.tensor_buffer
+                    for buffer in self.buffers
+                    if buffer.tensor_buffer is not None
+                ),
+                None,
+            )
+            if first_tensor is None:
+                raise RuntimeError("Buffer is empty")
+            return first_tensor[:0]
+        return torch.stack([tensor for _value, tensor in entries])
+
+    def get_bottom_k(self, k: int) -> torch.Tensor:
+        entries = self._view_entries()
+        k = min(max(k, 0), len(entries))
+        if k == 0:
+            return self.get_top_k(0)
+        return torch.stack([tensor for _value, tensor in entries[-k:]])
+
+    def get_top_p(self, p: float) -> torch.Tensor:
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"p must be in [0, 1], got {p}")
+        return self.get_top_k(int(p * len(self)))
+
+    def get_bottom_p(self, p: float) -> torch.Tensor:
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"p must be in [0, 1], got {p}")
+        return self.get_bottom_k(int(p * len(self)))
+
+    @staticmethod
+    def _stack_sampled_entries(
+        entries: list[tuple[list[float], torch.Tensor]],
+        positions: list[int],
+    ) -> torch.Tensor:
+        return torch.stack([entries[pos][1] for pos in positions])
+
+    def get_random_batch(self, batch_size: int) -> torch.Tensor:
+        if batch_size == 0:
+            return self.get_top_k(0)
+        entries = self._view_entries()
+        if batch_size > len(entries):
+            raise ValueError(
+                f"batch_size {batch_size} exceeds current buffer length {len(entries)}"
+            )
+        positions = random.sample(range(len(entries)), batch_size)
+        return self._stack_sampled_entries(entries, positions)
+
+    def get_random_batch_from_top_p(self, p: float, batch_size: int) -> torch.Tensor:
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"p must be in [0, 1], got {p}")
+        return self.get_random_batch_from_top_k(int(p * len(self)), batch_size)
+
+    def get_random_batch_from_top_k(self, k: int, batch_size: int) -> torch.Tensor:
+        if batch_size == 0:
+            return self.get_top_k(0)
+        entries = self._view_entries(limit=min(max(k, 0), len(self)))
+        if len(entries) < batch_size:
+            raise ValueError(
+                f"Cannot sample batch_size={batch_size} from top_k={len(entries)}"
+            )
+        positions = random.sample(range(len(entries)), batch_size)
+        return self._stack_sampled_entries(entries, positions)
+
+    def get_random_batch_from_bottom_p(self, p: float, batch_size: int) -> torch.Tensor:
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"p must be in [0, 1], got {p}")
+        return self.get_random_batch_from_bottom_k(int(p * len(self)), batch_size)
+
+    def get_random_batch_from_bottom_k(self, k: int, batch_size: int) -> torch.Tensor:
+        if batch_size == 0:
+            return self.get_top_k(0)
+        entries = self._view_entries()
+        bottom_entries = entries[-min(max(k, 0), len(entries)) :]
+        if len(bottom_entries) < batch_size:
+            raise ValueError(
+                "Cannot sample "
+                f"batch_size={batch_size} from bottom_k={len(bottom_entries)}"
+            )
+        positions = random.sample(range(len(bottom_entries)), batch_size)
+        return self._stack_sampled_entries(bottom_entries, positions)
+
+    def get_value(self, index: int, level: int = 0) -> float:
+        entries = self._view_entries()
+        if not entries:
+            raise IndexError("Buffer is empty")
+        index %= len(entries)
+        level %= self.value_levels.num_levels()
+        return entries[index][0][level]
+
+    def get_mean_buffer_value(self, level: int = 0) -> float:
+        values = self.get_sorted_values()
+        if not values:
+            raise IndexError("Buffer is empty")
+        if level < 0:
+            level = self.value_levels.num_levels() + level
+        return float(np.mean([value[level] for value in values]))
+
+    def len(self) -> int:
+        return min(self.buffer_size, sum(len(buffer) for buffer in self.buffers))
+
+    def __len__(self) -> int:
+        return self.len()
+
+    def clear(self) -> None:
+        for buffer in self.buffers:
+            buffer.clear()
+        self.niche_anchor_proxies = [None for _ in range(self.niche_count)]
+
+    def get_niche_stats(self) -> list[dict[str, float]]:
+        """Return per-niche telemetry for experiment history."""
+        top_tensors: list[torch.Tensor | None] = []
+        stats: list[dict[str, float]] = []
+        for niche_idx, (capacity, buffer) in enumerate(
+            zip(self.niche_capacities, self.buffers, strict=True)
+        ):
+            if len(buffer) == 0:
+                top_tensors.append(None)
+                stats.append(
+                    {
+                        "niche_index": float(niche_idx),
+                        "capacity": float(capacity),
+                        "size": 0.0,
+                        "best_last": float("nan"),
+                        "best_feasible_last": float("nan"),
+                        "mean_last": float("nan"),
+                        "median_last": float("nan"),
+                        "p10_last": float("nan"),
+                        "p90_last": float("nan"),
+                        "representative_min_hamming": float("nan"),
+                        "representative_mean_hamming": float("nan"),
+                    }
+                )
+                continue
+
+            values = np.asarray(buffer.get_sorted_values(), dtype=np.float32)
+            if values.ndim == 1:
+                values = values[:, None]
+            last = values[:, -1]
+            best_feasible_last = float("nan")
+            if values.shape[1] >= 3:
+                feasible = (values[:, -3] <= 1e-6) & (values[:, -2] <= 1e-6)
+                if np.any(feasible):
+                    best_feasible_last = float(np.min(last[feasible]))
+            top_tensors.append(buffer.get_top_k(1)[0].detach().cpu())
+            stats.append(
+                {
+                    "niche_index": float(niche_idx),
+                    "capacity": float(capacity),
+                    "size": float(len(buffer)),
+                    "best_last": float(last[0]),
+                    "best_feasible_last": best_feasible_last,
+                    "mean_last": float(np.mean(last)),
+                    "median_last": float(np.median(last)),
+                    "p10_last": float(np.percentile(last, 10)),
+                    "p90_last": float(np.percentile(last, 90)),
+                    "representative_min_hamming": float("nan"),
+                    "representative_mean_hamming": float("nan"),
+                }
+            )
+
+        valid_tensors = [tensor for tensor in top_tensors if tensor is not None]
+        if len(valid_tensors) >= 2:
+            proxies = self._proxy(valid_tensors)
+            valid_position = 0
+            for idx, tensor in enumerate(top_tensors):
+                if tensor is None:
+                    continue
+                distances = self._hamming_distance(proxies[valid_position], proxies)
+                distances = torch.cat(
+                    [
+                        distances[:valid_position],
+                        distances[valid_position + 1 :],
+                    ]
+                )
+                stats[idx]["representative_min_hamming"] = float(distances.min().item())
+                stats[idx]["representative_mean_hamming"] = float(
+                    distances.mean().item()
+                )
+                valid_position += 1
+        return stats
+
+
+def objective_value_row(value: Any) -> list[float]:
+    """Normalize one objective result row to a list of floats."""
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim == 0:
+        return [float(array)]
+    return [float(item) for item in array.reshape(-1)]
+
+
+def buffer_current_entries(buffer_impl: Any) -> list[tuple[list[float], torch.Tensor]]:
+    """Return ranked buffer entries without depending on a specific wrapper."""
+    if hasattr(buffer_impl, "_current_entries"):
+        return buffer_impl._current_entries()
+    return [
+        ([float(v) for v in value], buffer_impl.get(idx).detach().clone())
+        for idx, value in enumerate(buffer_impl.get_sorted_values())
+    ]
+
+
+def rebuild_buffer_entries(
+    buffer_impl: Any,
+    entries: list[tuple[list[float], torch.Tensor]],
+) -> None:
+    """Clear and repopulate a buffer wrapper from evaluated entries."""
+    normalized_entries = [
+        ([float(v) for v in value], tensor.detach().clone())
+        for value, tensor in entries
+    ]
+    if isinstance(buffer_impl, NicheEliteBuffer):
+        buffer_impl.rebuild_from_entries(normalized_entries)
+        return
+
+    tensors = [tensor for _value, tensor in normalized_entries]
+    values = [value for value, _tensor in normalized_entries]
+    if isinstance(buffer_impl, DiverseEliteBuffer):
+        buffer_impl.inner.clear()
+        if tensors:
+            buffer_impl.insert_many(tensors=tensors, values=values)
+        return
+
+    buffer_impl.clear()
+    if tensors:
+        buffer_impl.insert_many(tensors=tensors, values=values)
+
+
+def reevaluate_buffer_entries(
+    buffer_impl: Any,
+    objective_fn: Callable[[torch.Tensor], list[list[float]]],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+) -> int:
+    """Re-score all current buffer entries under the current objective."""
+    entries = buffer_current_entries(buffer_impl)
+    if not entries:
+        return 0
+    chunk_size = max(int(batch_size), 1)
+    revalued: list[tuple[list[float], torch.Tensor]] = []
+    for start in range(0, len(entries), chunk_size):
+        chunk = entries[start : start + chunk_size]
+        batch = torch.stack([tensor for _value, tensor in chunk]).to(
+            device=device,
+            dtype=dtype,
+        )
+        values = objective_fn(batch)
+        if len(values) != len(chunk):
+            raise ValueError(
+                "Objective returned "
+                f"{len(values)} rows for re-evaluation batch of size {len(chunk)}"
+            )
+        revalued.extend(
+            (objective_value_row(value), tensor)
+            for value, (_old_value, tensor) in zip(values, chunk, strict=True)
+        )
+    rebuild_buffer_entries(buffer_impl, revalued)
+    return len(revalued)
+
+
 def save_design_grid(
     designs: torch.Tensor,
     actual_compliance: np.ndarray,
@@ -2183,6 +3885,45 @@ def save_design_grid(
             fontsize=9,
         )
 
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_per_niche_design_grid(
+    designs: np.ndarray,
+    values: np.ndarray,
+    output_path: Path,
+    *,
+    title: str,
+) -> None:
+    """Save a grid of top designs grouped by niche."""
+    if designs.size == 0:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    niche_count, top_k = designs.shape[:2]
+    fig, axes = plt.subplots(
+        niche_count,
+        top_k,
+        figsize=(3.6 * top_k, 2.4 * niche_count),
+        squeeze=False,
+    )
+    for niche_idx in range(niche_count):
+        for rank_idx in range(top_k):
+            ax = axes[niche_idx, rank_idx]
+            design = designs[niche_idx, rank_idx]
+            if not np.isfinite(design).any():
+                ax.axis("off")
+                continue
+            compliance = float(values[niche_idx, rank_idx, -1])
+            ax.imshow(design, cmap="gray_r", vmin=0.0, vmax=1.0)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(
+                f"niche {niche_idx}, rank {rank_idx + 1}\ncomp={compliance:.3f}",
+                fontsize=8,
+            )
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
@@ -2391,13 +4132,11 @@ class PlummerEmbeddingRepulsion(torch.nn.Module):
             raise ValueError(f"plummer eps must be positive, got {eps}")
         if normalize not in {"none", "layernorm", "l2"}:
             raise ValueError(
-                "plummer normalize must be one of none, layernorm, l2; "
-                f"got {normalize}"
+                f"plummer normalize must be one of none, layernorm, l2; got {normalize}"
             )
         if terms not in {"batch", "buffer", "batch_buffer"}:
             raise ValueError(
-                "plummer terms must be one of batch, buffer, batch_buffer; "
-                f"got {terms}"
+                f"plummer terms must be one of batch, buffer, batch_buffer; got {terms}"
             )
         self.buffer = buffer
         self.weight = weight
@@ -2878,8 +4617,7 @@ class BufferPlackettLuceRankerOpt(BaseOpt):
         self.proposal_gradient_keep_original = proposal_gradient_keep_original
         if not 0.0 <= ga_offspring_fraction <= 1.0:
             raise ValueError(
-                "ga_offspring_fraction must be in [0, 1], "
-                f"got {ga_offspring_fraction}"
+                f"ga_offspring_fraction must be in [0, 1], got {ga_offspring_fraction}"
             )
         if ga_parent_pool_size < 2:
             raise ValueError(
@@ -3466,8 +5204,7 @@ class ContextualPlackettLuceRankerOpt(BufferPlackettLuceRankerOpt):
             )
         if d_score_scale_weight < 0:
             raise ValueError(
-                "d_score_scale_weight must be non-negative, "
-                f"got {d_score_scale_weight}"
+                f"d_score_scale_weight must be non-negative, got {d_score_scale_weight}"
             )
         if d_score_target_std <= 0:
             raise ValueError(
@@ -3620,7 +5357,7 @@ class CalibratedUtilityRankerOpt(ContextualPlackettLuceRankerOpt):
             )
         if utility_loss not in {"smooth_l1", "mse"}:
             raise ValueError(
-                "utility_loss must be one of smooth_l1, mse; " f"got {utility_loss}"
+                f"utility_loss must be one of smooth_l1, mse; got {utility_loss}"
             )
         self.utility_target_scale = utility_target_scale
         self.utility_loss = utility_loss
@@ -4185,6 +5922,7 @@ class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
         ranker_sample_pool_size: int | None = None,
         ranker_sample_mode: str = "random_top_pool",
         ranker_target_scope: str = "local",
+        ranker_niche_local_targets: bool = False,
         ranker_list_repeats: int = 1,
         ranker_fake_weight: float = 1.0,
         ranker_fake_repeats: int = 1,
@@ -4217,6 +5955,27 @@ class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
         generator_elite_context_size: int = 0,
         generator_elite_context_pool_size: int | None = None,
     ) -> None:
+        if ranker_niche_local_targets:
+            niche_buffer = opt_components.buffer.B
+            required_methods = (
+                "niche_count",
+                "get_niche",
+                "get_niche_length",
+                "get_niche_top_k",
+            )
+            missing = [
+                name for name in required_methods if not hasattr(niche_buffer, name)
+            ]
+            if missing:
+                raise ValueError(
+                    "--ranker_niche_local_targets requires a niche buffer; "
+                    f"missing {missing}"
+                )
+            if ranker_list_size < int(niche_buffer.niche_count):
+                raise ValueError(
+                    "ranker_list_size must be >= niche_count when "
+                    "--ranker_niche_local_targets is set"
+                )
         super().__init__(
             opt_components,
             ranker_list_size=ranker_list_size,
@@ -4279,36 +6038,125 @@ class QuantileRankedDefaultOpt(BufferPlackettLuceRankerOpt):
                 f"got {ranker_target_scope}"
             )
         self.ranker_target_scope = ranker_target_scope
+        self.ranker_niche_local_targets = ranker_niche_local_targets
+
+    def _ranked_niche_buffer_subset_with_positions(
+        self,
+        niche_idx: int,
+        k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current_len = self.buffer.B.get_niche_length(niche_idx)
+        if current_len == 0:
+            raise RuntimeError(f"Cannot sample from empty niche {niche_idx}")
+        if self.ranker_sample_mode == "top_k":
+            k = min(k, current_len)
+            ranked = self.buffer.B.get_niche_top_k(niche_idx, k)
+            positions = torch.arange(
+                k,
+                device=self.gan.device,
+                dtype=self.gan.dtype,
+            )
+            return ranked.to(self.gan.device, self.gan.dtype), positions
+
+        pool_size = current_len
+        if self.ranker_sample_pool_size is not None:
+            per_niche_pool_size = math.ceil(
+                self.ranker_sample_pool_size / self.buffer.B.niche_count
+            )
+            pool_size = min(current_len, max(k, per_niche_pool_size))
+        k = min(k, pool_size)
+        if k == pool_size:
+            ranked = self.buffer.B.get_niche_top_k(niche_idx, k)
+            positions = torch.arange(
+                k,
+                device=self.gan.device,
+                dtype=self.gan.dtype,
+            )
+        else:
+            position_list = torch.randperm(pool_size)[:k].sort().values.tolist()
+            ranked = torch.stack(
+                [self.buffer.B.get_niche(niche_idx, int(pos)) for pos in position_list]
+            )
+            positions = torch.as_tensor(
+                position_list,
+                device=self.gan.device,
+                dtype=self.gan.dtype,
+            )
+        return ranked.to(self.gan.device, self.gan.dtype), positions
+
+    def _niche_local_real_rank_loss(self) -> torch.Tensor:
+        niche_count = int(self.buffer.B.niche_count)
+        list_sizes = niche_capacities(self.ranker_list_size, niche_count)
+        repeat_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+        active_repeats = 0
+        for _ in range(self.ranker_list_repeats):
+            niche_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+            active_niches = 0
+            for niche_idx, list_size in enumerate(list_sizes):
+                if self.buffer.B.get_niche_length(niche_idx) < 2:
+                    continue
+                ranked, positions = self._ranked_niche_buffer_subset_with_positions(
+                    niche_idx,
+                    list_size,
+                )
+                real_scores = self.gan.D(ranked)
+                if self.ranker_target_scope == "global":
+                    real_targets = rank_targets(
+                        self.buffer.B.get_niche_length(niche_idx),
+                        device=real_scores.device,
+                        dtype=real_scores.dtype,
+                        curve=self.ranker_target_curve,
+                        tau=self.ranker_tau,
+                    )[positions.long()].reshape_as(real_scores)
+                else:
+                    real_targets = rank_targets(
+                        real_scores.numel(),
+                        device=real_scores.device,
+                        dtype=real_scores.dtype,
+                        curve=self.ranker_target_curve,
+                        tau=self.ranker_tau,
+                    ).reshape_as(real_scores)
+                niche_loss = niche_loss + self.gan.loss(real_scores, real_targets)
+                active_niches += 1
+            if active_niches > 0:
+                repeat_loss = repeat_loss + niche_loss / active_niches
+                active_repeats += 1
+        if active_repeats == 0:
+            return repeat_loss
+        return repeat_loss / active_repeats
 
     def _train_ranker_step(self) -> None:
         if len(self.buffer.B) < 2:
             return
         self.gan.optimizerD.zero_grad()
 
-        real_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
-        for _ in range(self.ranker_list_repeats):
-            ranked, positions = self._ranked_buffer_subset_with_positions(
-                self.ranker_list_size
-            )
-            real_scores = self.gan.D(ranked)
-            if self.ranker_target_scope == "global":
-                real_targets = rank_targets(
-                    len(self.buffer.B),
-                    device=real_scores.device,
-                    dtype=real_scores.dtype,
-                    curve=self.ranker_target_curve,
-                    tau=self.ranker_tau,
-                )[positions.long()].reshape_as(real_scores)
-            else:
-                real_targets = rank_targets(
-                    real_scores.numel(),
-                    device=real_scores.device,
-                    dtype=real_scores.dtype,
-                    curve=self.ranker_target_curve,
-                    tau=self.ranker_tau,
-                ).reshape_as(real_scores)
-            real_loss = real_loss + self.gan.loss(real_scores, real_targets)
-        real_loss = real_loss / self.ranker_list_repeats
+        if self.ranker_niche_local_targets:
+            real_loss = self._niche_local_real_rank_loss()
+        else:
+            real_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
+            for _ in range(self.ranker_list_repeats):
+                ranked, positions = self._ranked_buffer_subset_with_positions(
+                    self.ranker_list_size
+                )
+                real_scores = self.gan.D(ranked)
+                if self.ranker_target_scope == "global":
+                    real_targets = rank_targets(
+                        len(self.buffer.B),
+                        device=real_scores.device,
+                        dtype=real_scores.dtype,
+                        curve=self.ranker_target_curve,
+                        tau=self.ranker_tau,
+                    )[positions.long()].reshape_as(real_scores)
+                else:
+                    real_targets = rank_targets(
+                        real_scores.numel(),
+                        device=real_scores.device,
+                        dtype=real_scores.dtype,
+                        curve=self.ranker_target_curve,
+                        tau=self.ranker_tau,
+                    ).reshape_as(real_scores)
+                real_loss = real_loss + self.gan.loss(real_scores, real_targets)
+            real_loss = real_loss / self.ranker_list_repeats
 
         fake_loss = torch.zeros((), device=self.gan.device, dtype=self.gan.dtype)
         if self.ranker_fake_weight > 0:
@@ -4579,6 +6427,7 @@ def make_optimizer(
     ranker_sample_pool_size: int | None = None,
     ranker_sample_mode: str = "random_top_pool",
     ranker_target_scope: str = "local",
+    ranker_niche_local_targets: bool = False,
     ranker_list_repeats: int = 1,
     ranker_fake_weight: float = 1.0,
     ranker_fake_repeats: int = 1,
@@ -4919,6 +6768,7 @@ def make_optimizer(
             ranker_sample_pool_size=ranker_sample_pool_size,
             ranker_sample_mode=ranker_sample_mode,
             ranker_target_scope=ranker_target_scope,
+            ranker_niche_local_targets=ranker_niche_local_targets,
             ranker_list_repeats=ranker_list_repeats,
             ranker_fake_weight=ranker_fake_weight,
             ranker_fake_repeats=ranker_fake_repeats,
@@ -5007,10 +6857,15 @@ def make_decoded_density_optimizer(
     opt_components: components.OptComponents,
     *,
     evaluator: FEMCantileverEvaluator,
+    objective: BufferChamferDiversityObjective | None = None,
 ) -> BaseOpt:
     kwargs = {
         "decoder": evaluator.decode_designs_torch,
-        "density_objective": evaluator.evaluate_densities_numpy,
+        "density_objective": (
+            objective.evaluate_densities_numpy
+            if objective is not None
+            else evaluator.evaluate_densities_numpy
+        ),
     }
     if optimizer_type == "default":
         return DecodedDensityDefaultOpt(opt_components, **kwargs)
@@ -5081,7 +6936,7 @@ def record_buffer_history(
         mean_roughness_violation = float(np.mean(roughness_violation))
         if np.any(feasible):
             best_feasible_last = float(np.min(last_level[feasible]))
-    if values.shape[1] >= 4:
+    if values.shape[1] == 4:
         maybe_connectivity_violation = values[:, -4]
         mean_connectivity_violation = float(np.mean(maybe_connectivity_violation))
     return {
@@ -5099,6 +6954,56 @@ def record_buffer_history(
         "mean_roughness_violation": mean_roughness_violation,
         "mean_connectivity_violation": mean_connectivity_violation,
     }
+
+
+NICHE_HISTORY_COLUMNS = np.asarray(
+    [
+        "iteration",
+        "eval_count",
+        "niche_index",
+        "capacity",
+        "size",
+        "best_last",
+        "best_feasible_last",
+        "mean_last",
+        "median_last",
+        "p10_last",
+        "p90_last",
+        "representative_min_hamming",
+        "representative_mean_hamming",
+    ]
+)
+
+
+def record_niche_history(
+    buffer: Any,
+    *,
+    iteration: int,
+    eval_count: int,
+) -> np.ndarray:
+    """Capture per-niche telemetry when the buffer supports it."""
+    if not hasattr(buffer, "get_niche_stats"):
+        return np.empty((0, len(NICHE_HISTORY_COLUMNS)), dtype=np.float32)
+    rows = []
+    for stat in buffer.get_niche_stats():
+        rows.append(
+            [
+                float(iteration),
+                float(eval_count),
+                stat["niche_index"],
+                stat["capacity"],
+                stat["size"],
+                stat["best_last"],
+                stat["best_feasible_last"],
+                stat["mean_last"],
+                stat["median_last"],
+                stat["p10_last"],
+                stat["p90_last"],
+                stat["representative_min_hamming"],
+                stat["representative_mean_hamming"],
+            ]
+        )
+    return np.asarray(rows, dtype=np.float32)
 
 
 def history_arrays(
@@ -5442,6 +7347,64 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sorted_material_steepness", type=float, default=12.0)
     parser.add_argument(
+        "--initial_buffer_mode",
+        choices=["generator", "random_blobs"],
+        default="generator",
+        help=(
+            "How to fill the initial rank buffer. random_blobs seeds "
+            "sorted-material score vectors from diverse blob masks before G training."
+        ),
+    )
+    parser.add_argument("--initial_blob_count_min", type=int, default=1)
+    parser.add_argument("--initial_blob_count_max", type=int, default=5)
+    parser.add_argument(
+        "--initial_blob_radius_min",
+        type=float,
+        default=0.06,
+        help="Minimum normalized blob radius for --initial_buffer_mode random_blobs.",
+    )
+    parser.add_argument(
+        "--initial_blob_radius_max",
+        type=float,
+        default=0.24,
+        help="Maximum normalized blob radius for --initial_buffer_mode random_blobs.",
+    )
+    parser.add_argument(
+        "--initial_blob_score_margin",
+        type=float,
+        default=1.0,
+        help="Score separation between material and void cells in blob seed codes.",
+    )
+    parser.add_argument(
+        "--initial_blob_score_noise",
+        type=float,
+        default=0.01,
+        help="Tie-breaking score noise for blob seed codes.",
+    )
+    parser.add_argument(
+        "--initial_blob_candidate_multiplier",
+        type=int,
+        default=8,
+        help="Over-generate this many blob candidates per requested buffer seed.",
+    )
+    parser.add_argument(
+        "--initial_blob_min_hamming",
+        type=float,
+        default=0.1,
+        help=(
+            "Greedy target minimum pairwise Hamming distance between initial "
+            "blob seed masks after deduplication."
+        ),
+    )
+    parser.add_argument(
+        "--initial_blob_cluster_niches",
+        action="store_true",
+        help=(
+            "For random_blobs plus a niche buffer, initialize each niche from a "
+            "balanced Hamming cluster instead of globally diverse seeds."
+        ),
+    )
+    parser.add_argument(
         "--generator_type",
         choices=["mlp", "conv", "set_conv", "set_direct"],
         default="mlp",
@@ -5510,9 +7473,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixed_latent_bank_size", type=int, default=None)
     parser.add_argument(
         "--fixed_latent_selection",
-        choices=["random", "output_diverse"],
+        choices=["random", "output_diverse", "clustered_niches"],
         default="output_diverse",
-        help="How to choose fixed latent bank entries from an initial random candidate pool.",
+        help="How to choose fixed latent bank entries.",
     )
     parser.add_argument(
         "--fixed_latent_candidate_multiplier",
@@ -5528,9 +7491,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fixed_latent_sample_mode",
-        choices=["random", "shuffle_cycle"],
+        choices=["random", "shuffle_cycle", "balanced_niches"],
         default="shuffle_cycle",
         help="How optimizer batches are drawn from the fixed latent bank.",
+    )
+    parser.add_argument(
+        "--fixed_latent_niche_count",
+        type=int,
+        default=None,
+        help=(
+            "Number of latent clusters for --fixed_latent_selection clustered_niches. "
+            "Defaults to max(niche_buffer_count, 2)."
+        ),
+    )
+    parser.add_argument(
+        "--fixed_latent_niche_center_scale",
+        type=float,
+        default=4.0,
+        help="Distance scale of clustered fixed latent niche centers.",
+    )
+    parser.add_argument(
+        "--fixed_latent_niche_within_std",
+        type=float,
+        default=0.35,
+        help="Gaussian spread of fixed latents inside each latent niche.",
+    )
+    parser.add_argument(
+        "--fixed_latent_niche_no_normalize_radius",
+        action="store_true",
+        help="Do not normalize clustered fixed latents to the usual sqrt(latent_dim) radius.",
     )
     parser.add_argument(
         "--fixed_latent_noise_std",
@@ -5576,6 +7565,69 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.48,
         help="Top-k fraction used to binarize raw scores for buffer diversity.",
+    )
+    parser.add_argument(
+        "--niche_buffer_count",
+        type=int,
+        default=1,
+        help=(
+            "If >1, split the elite archive into this many independent design "
+            "niches instead of one global buffer."
+        ),
+    )
+    parser.add_argument(
+        "--niche_buffer_min_hamming",
+        type=float,
+        default=0.1,
+        help=(
+            "Target minimum decoded-design Hamming distance between niche "
+            "representatives."
+        ),
+    )
+    parser.add_argument(
+        "--niche_buffer_view_mode",
+        choices=["balanced", "global"],
+        default="balanced",
+        help=(
+            "Expose either a round-robin balanced view across niches or a "
+            "globally sorted view to D/history."
+        ),
+    )
+    parser.add_argument(
+        "--niche_buffer_cross_min_hamming",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, reject inserts whose decoded design is closer than this "
+            "Hamming distance to top designs in another niche."
+        ),
+    )
+    parser.add_argument(
+        "--niche_buffer_cross_reference_top_k",
+        type=int,
+        default=1,
+        help=(
+            "Number of top designs per other niche used by "
+            "--niche_buffer_cross_min_hamming."
+        ),
+    )
+    parser.add_argument(
+        "--niche_output_separation_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Extra G-side loss weight that repels raw output prototypes for "
+            "samples routed to different stable niche anchors."
+        ),
+    )
+    parser.add_argument(
+        "--niche_output_separation_margin",
+        type=float,
+        default=0.35,
+        help=(
+            "Minimum centered-L2 distance between generated output prototypes "
+            "assigned to different niches."
+        ),
     )
     parser.add_argument("--curiosity", type=float, default=10.0)
     parser.add_argument(
@@ -5739,6 +7791,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["local", "global"],
         default="local",
         help="Use local sampled-list ranks or global buffer ranks for quantile targets.",
+    )
+    parser.add_argument(
+        "--ranker_niche_local_targets",
+        action="store_true",
+        help=(
+            "For quantile_ranked_default with a niche buffer, build rank targets "
+            "separately inside each niche before averaging the D real loss."
+        ),
     )
     parser.add_argument(
         "--ranker_list_repeats",
@@ -6004,6 +8064,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roughness_ladder", nargs="*", type=float, default=[])
     parser.add_argument("--connectivity_ladder", nargs="*", type=float, default=[])
     parser.add_argument(
+        "--diversity_ladder",
+        nargs="*",
+        type=float,
+        default=[],
+        help=(
+            "Minimum boundary-Chamfer distance from current top-buffer designs. "
+            "Adds max(bound - chamfer, 0) violations; usually prefer "
+            "--ladder_sequence for interleaving with compliance."
+        ),
+    )
+    parser.add_argument(
+        "--diversity_reference_size",
+        type=int,
+        default=32,
+        help="Number of top-buffer designs used as Chamfer diversity references.",
+    )
+    parser.add_argument(
+        "--diversity_chamfer_max_points",
+        type=int,
+        default=256,
+        help="Maximum boundary points per design for the Chamfer diversity proxy.",
+    )
+    parser.add_argument(
         "--removal_ladder_volumes",
         nargs="*",
         type=float,
@@ -6094,7 +8177,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of CPU worker threads for parallel SciPy FEM batch evaluation.",
     )
+    parser.add_argument(
+        "--compliance_solver",
+        choices=["direct", "matrix_free_cg"],
+        default="direct",
+        help="Forward compliance solver used by the SciPy backend.",
+    )
+    parser.add_argument(
+        "--matrix_free_cg_max_iter",
+        type=int,
+        default=1000,
+        help="Maximum Jacobi-CG iterations for --compliance_solver matrix_free_cg.",
+    )
+    parser.add_argument(
+        "--matrix_free_cg_tol",
+        type=float,
+        default=1e-6,
+        help="Relative residual tolerance for --compliance_solver matrix_free_cg.",
+    )
+    parser.add_argument(
+        "--matrix_free_cg_device",
+        type=str,
+        default="cpu",
+        help="Torch device for the matrix-free CG solve.",
+    )
+    parser.add_argument(
+        "--matrix_free_cg_dtype",
+        choices=["float32", "float64"],
+        default="float64",
+        help="Torch dtype for the matrix-free CG solve. Use float32 for MPS.",
+    )
     parser.add_argument("--density_filter_radius", type=int, default=1)
+    parser.add_argument(
+        "--density_filter_warmup_iters",
+        type=int,
+        default=0,
+        help=(
+            "If >0, use --density_filter_radius for this many optimizer iterations, "
+            "then switch to --density_filter_final_radius and re-score the buffer."
+        ),
+    )
+    parser.add_argument(
+        "--density_filter_final_radius",
+        type=int,
+        default=0,
+        help=(
+            "Density filter radius after --density_filter_warmup_iters. "
+            "Use 0 to remove smoothing after the warmup."
+        ),
+    )
     parser.add_argument("--projection_beta", type=float, default=0.0)
     parser.add_argument("--projection_eta", type=float, default=0.5)
     parser.add_argument("--hard_binarize", action="store_true")
@@ -6161,6 +8292,21 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         if args.density_filter_radius == 1:
             args.density_filter_radius = 0
 
+    if args.density_filter_radius < 0:
+        raise ValueError(
+            f"--density_filter_radius must be non-negative, got {args.density_filter_radius}"
+        )
+    if args.density_filter_warmup_iters < 0:
+        raise ValueError(
+            "--density_filter_warmup_iters must be non-negative, got "
+            f"{args.density_filter_warmup_iters}"
+        )
+    if args.density_filter_final_radius < 0:
+        raise ValueError(
+            "--density_filter_final_radius must be non-negative, got "
+            f"{args.density_filter_final_radius}"
+        )
+
     if args.train_on_decoded:
         if args.encoding not in {"direct", "soft_volume", "coarse", "coarse_residual"}:
             raise ValueError(
@@ -6197,6 +8343,25 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"--fem_workers must be >= 1, got {args.fem_workers}")
     if args.backend == "torchfem" and args.fem_workers != 1:
         raise ValueError("--fem_workers > 1 is only supported for --backend scipy")
+    if args.backend != "scipy" and args.compliance_solver != "direct":
+        raise ValueError("--compliance_solver matrix_free_cg requires --backend scipy")
+    if args.matrix_free_cg_max_iter < 1:
+        raise ValueError(
+            "--matrix_free_cg_max_iter must be >= 1, got "
+            f"{args.matrix_free_cg_max_iter}"
+        )
+    if args.matrix_free_cg_tol <= 0.0:
+        raise ValueError(
+            f"--matrix_free_cg_tol must be positive, got {args.matrix_free_cg_tol}"
+        )
+    if (
+        args.compliance_solver == "matrix_free_cg"
+        and args.matrix_free_cg_device.startswith("mps")
+        and args.matrix_free_cg_dtype == "float64"
+    ):
+        raise ValueError(
+            "--matrix_free_cg_device mps requires --matrix_free_cg_dtype float32"
+        )
     if args.robust_load_cvar_frac <= 0.0 or args.robust_load_cvar_frac > 1.0:
         raise ValueError(
             "--robust_load_cvar_frac must be in (0, 1], got "
@@ -6204,6 +8369,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         )
     if args.backend == "torchfem" and args.robust_load_cases:
         raise ValueError("--robust_load_cases is only supported for --backend scipy")
+    if args.compliance_solver == "matrix_free_cg" and args.robust_load_cases:
+        raise ValueError(
+            "--compliance_solver matrix_free_cg currently supports one load case"
+        )
     if args.removal_ladder_volumes:
         if args.encoding not in {"topk_volume", "sorted_material"}:
             raise ValueError(
@@ -6213,7 +8382,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         for volume in args.removal_ladder_volumes:
             if volume <= 0.0 or volume > 1.0:
                 raise ValueError(
-                    "removal ladder volumes must be in (0, 1], got " f"{volume}"
+                    f"removal ladder volumes must be in (0, 1], got {volume}"
                 )
         if args.removal_ladder_compliances and (
             len(args.removal_ladder_compliances) != len(args.removal_ladder_volumes)
@@ -6235,6 +8404,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             or args.compliance_ladder
             or args.roughness_ladder
             or args.connectivity_ladder
+            or args.diversity_ladder
             or args.ladder_sequence
             or args.levels_ladder
         ):
@@ -6247,6 +8417,61 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         and args.curiosity_reference != "buffer"
     ):
         raise ValueError("--plummer_terms buffer requires --curiosity_reference buffer")
+    if args.diversity_reference_size < 1:
+        raise ValueError(
+            "--diversity_reference_size must be >= 1, got "
+            f"{args.diversity_reference_size}"
+        )
+    if args.diversity_chamfer_max_points < 1:
+        raise ValueError(
+            "--diversity_chamfer_max_points must be >= 1, got "
+            f"{args.diversity_chamfer_max_points}"
+        )
+    if args.initial_buffer_mode == "random_blobs":
+        if args.encoding != "sorted_material":
+            raise ValueError(
+                "--initial_buffer_mode random_blobs currently requires "
+                "--encoding sorted_material"
+            )
+        if args.initial_blob_count_min < 1:
+            raise ValueError(
+                "--initial_blob_count_min must be >= 1, got "
+                f"{args.initial_blob_count_min}"
+            )
+        if args.initial_blob_count_max < args.initial_blob_count_min:
+            raise ValueError(
+                "--initial_blob_count_max must be >= --initial_blob_count_min, got "
+                f"{args.initial_blob_count_max} and {args.initial_blob_count_min}"
+            )
+        if not 0.0 < args.initial_blob_radius_min <= args.initial_blob_radius_max:
+            raise ValueError(
+                "--initial_blob_radius_min/max must satisfy 0 < min <= max, got "
+                f"{args.initial_blob_radius_min} and {args.initial_blob_radius_max}"
+            )
+        if args.initial_blob_score_margin <= 0:
+            raise ValueError(
+                "--initial_blob_score_margin must be positive, got "
+                f"{args.initial_blob_score_margin}"
+            )
+        if args.initial_blob_score_noise < 0:
+            raise ValueError(
+                "--initial_blob_score_noise must be non-negative, got "
+                f"{args.initial_blob_score_noise}"
+            )
+        if args.initial_blob_candidate_multiplier < 1:
+            raise ValueError(
+                "--initial_blob_candidate_multiplier must be >= 1, got "
+                f"{args.initial_blob_candidate_multiplier}"
+            )
+        if not 0.0 <= args.initial_blob_min_hamming <= 1.0:
+            raise ValueError(
+                "--initial_blob_min_hamming must be in [0, 1], got "
+                f"{args.initial_blob_min_hamming}"
+            )
+    elif args.initial_blob_cluster_niches:
+        raise ValueError(
+            "--initial_blob_cluster_niches requires --initial_buffer_mode random_blobs"
+        )
     if args.history_interval < 1:
         raise ValueError(
             f"--history_interval must be >= 1, got {args.history_interval}"
@@ -6270,6 +8495,73 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             "--proposal_buffer_novelty_threshold must be in [0, 1], got "
             f"{args.proposal_buffer_novelty_threshold}"
         )
+    if args.niche_buffer_count < 1:
+        raise ValueError(
+            f"--niche_buffer_count must be >= 1, got {args.niche_buffer_count}"
+        )
+    if not 0.0 <= args.niche_buffer_min_hamming <= 1.0:
+        raise ValueError(
+            "--niche_buffer_min_hamming must be in [0, 1], got "
+            f"{args.niche_buffer_min_hamming}"
+        )
+    if args.niche_buffer_count > args.buffer_multiplier * args.batch_size:
+        raise ValueError(
+            "--niche_buffer_count must not exceed total buffer size, got "
+            f"{args.niche_buffer_count} niches for "
+            f"{args.buffer_multiplier * args.batch_size} buffer slots"
+        )
+    if args.niche_buffer_count > 1 and args.buffer_diversity_min_hamming > 0:
+        raise ValueError(
+            "--niche_buffer_count cannot currently be combined with "
+            "--buffer_diversity_min_hamming"
+        )
+    if not 0.0 <= args.niche_buffer_cross_min_hamming <= 1.0:
+        raise ValueError(
+            "--niche_buffer_cross_min_hamming must be in [0, 1], got "
+            f"{args.niche_buffer_cross_min_hamming}"
+        )
+    if args.niche_buffer_cross_reference_top_k <= 0:
+        raise ValueError(
+            "--niche_buffer_cross_reference_top_k must be positive, got "
+            f"{args.niche_buffer_cross_reference_top_k}"
+        )
+    if args.niche_buffer_cross_min_hamming > 0 and args.niche_buffer_count <= 1:
+        raise ValueError(
+            "--niche_buffer_cross_min_hamming requires --niche_buffer_count > 1"
+        )
+    if args.niche_output_separation_weight < 0:
+        raise ValueError(
+            "--niche_output_separation_weight must be non-negative, got "
+            f"{args.niche_output_separation_weight}"
+        )
+    if args.niche_output_separation_margin <= 0:
+        raise ValueError(
+            "--niche_output_separation_margin must be positive, got "
+            f"{args.niche_output_separation_margin}"
+        )
+    if args.niche_output_separation_weight > 0 and args.niche_buffer_count <= 1:
+        raise ValueError(
+            "--niche_output_separation_weight requires --niche_buffer_count > 1"
+        )
+    if args.initial_blob_cluster_niches and args.niche_buffer_count <= 1:
+        raise ValueError(
+            "--initial_blob_cluster_niches requires --niche_buffer_count > 1"
+        )
+    if args.ranker_niche_local_targets:
+        if args.optimizer_type != "quantile_ranked_default":
+            raise ValueError(
+                "--ranker_niche_local_targets currently requires "
+                "--optimizer_type quantile_ranked_default"
+            )
+        if args.niche_buffer_count <= 1:
+            raise ValueError(
+                "--ranker_niche_local_targets requires --niche_buffer_count > 1"
+            )
+        if args.ranker_list_size < args.niche_buffer_count:
+            raise ValueError(
+                "--ranker_list_size must be >= --niche_buffer_count when "
+                "--ranker_niche_local_targets is set"
+            )
 
     ladder_sequence = parse_ladder_sequence(args.ladder_sequence)
     levels_ladder_rungs = parse_levels_ladder_specs(args.levels_ladder)
@@ -6278,6 +8570,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         or args.compliance_ladder
         or args.roughness_ladder
         or args.connectivity_ladder
+        or args.diversity_ladder
         or ladder_sequence
         or args.connectivity_max is not None
     ):
@@ -6305,9 +8598,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         compliance_ladder=tuple(args.compliance_ladder),
         roughness_ladder=tuple(args.roughness_ladder),
         connectivity_ladder=tuple(args.connectivity_ladder),
+        diversity_ladder=tuple(args.diversity_ladder),
         ladder_sequence=ladder_sequence,
         use_levels_ladder=bool(levels_ladder_rungs),
         levels_ladder_objectives=tuple(rung.name for rung in levels_ladder_rungs),
+        diversity_reference_size=args.diversity_reference_size,
+        diversity_chamfer_max_points=args.diversity_chamfer_max_points,
         load_scale=args.load_scale,
         load_case=args.load_case,
         robust_load_cases=tuple(args.robust_load_cases),
@@ -6317,6 +8613,11 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         removal_ladder_compliances=tuple(args.removal_ladder_compliances),
         removal_ladder_connectivity_max=args.removal_ladder_connectivity_max,
         fem_workers=args.fem_workers,
+        compliance_solver=args.compliance_solver,
+        matrix_free_cg_max_iter=args.matrix_free_cg_max_iter,
+        matrix_free_cg_tol=args.matrix_free_cg_tol,
+        matrix_free_cg_device=args.matrix_free_cg_device,
+        matrix_free_cg_dtype=args.matrix_free_cg_dtype,
         density_filter_radius=args.density_filter_radius,
         projection_beta=args.projection_beta,
         projection_eta=args.projection_eta,
@@ -6367,6 +8668,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     if (
         args.proposal_buffer_novelty_min_hamming > 0
         or args.proposal_buffer_reject_exact_design_duplicates
+        or args.niche_buffer_count > 1
     ):
         novelty_threshold = args.proposal_buffer_novelty_threshold
 
@@ -6374,7 +8676,6 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             designs = evaluator.decode_designs_numpy(candidates.detach().cpu().numpy())
             return torch.from_numpy(designs >= novelty_threshold)
 
-    fn = components.Fn(f=evaluator, input_dim=f_dim, device=device, dtype=torch.float32)
     if args.generator_type == "mlp":
         g = MLP(
             input_dim=args.latent_dim,
@@ -6497,24 +8798,47 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             args.compliance_ladder,
             args.roughness_ladder,
             args.connectivity_ladder,
+            args.diversity_ladder,
             args.connectivity_max,
             ladder_sequence,
         )
         value_levels = Levels(level_names)
-    base_buffer = Buffer(
-        buffer_size=args.buffer_multiplier * args.batch_size,
-        value_levels=value_levels,
-    )
-    if args.buffer_diversity_min_hamming > 0:
-        buffer_impl = DiverseEliteBuffer(
-            base_buffer,
-            min_hamming=args.buffer_diversity_min_hamming,
-            topk_frac=args.buffer_diversity_topk_frac,
+    buffer_size = args.buffer_multiplier * args.batch_size
+    if args.niche_buffer_count > 1:
+        if proposal_design_proxy is None:
+            raise RuntimeError("niche buffer requires a decoded-design proxy")
+        buffer_impl = NicheEliteBuffer(
+            buffer_size=buffer_size,
+            value_levels=value_levels,
+            niche_count=args.niche_buffer_count,
+            design_proxy=proposal_design_proxy,
+            min_hamming=args.niche_buffer_min_hamming,
+            view_mode=args.niche_buffer_view_mode,
+            cross_niche_min_hamming=args.niche_buffer_cross_min_hamming,
+            cross_niche_reference_top_k=args.niche_buffer_cross_reference_top_k,
         )
     else:
-        buffer_impl = base_buffer
+        base_buffer = Buffer(
+            buffer_size=buffer_size,
+            value_levels=value_levels,
+        )
+        if args.buffer_diversity_min_hamming > 0:
+            buffer_impl = DiverseEliteBuffer(
+                base_buffer,
+                min_hamming=args.buffer_diversity_min_hamming,
+                topk_frac=args.buffer_diversity_topk_frac,
+            )
+        else:
+            buffer_impl = base_buffer
     buffer = components.BufferComp(
         B=buffer_impl,
+    )
+    objective = BufferChamferDiversityObjective(evaluator, buffer.B)
+    fn = components.Fn(
+        f=objective,
+        input_dim=f_dim,
+        device=device,
+        dtype=torch.float32,
     )
 
     curiosity_scheduler = None
@@ -6577,6 +8901,24 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         else:
             raise ValueError(f"Unknown curiosity_space: {args.curiosity_space}")
 
+    if args.niche_output_separation_weight > 0:
+        if proposal_design_proxy is None:
+            raise RuntimeError(
+                "niche output separation requires a decoded-design proxy"
+            )
+        existing_losses = []
+        if curiosity_loss is not None:
+            existing_losses.append(curiosity_loss)
+        existing_losses.append(
+            NicheOutputSeparationLoss(
+                buffer=buffer.B,
+                design_proxy=proposal_design_proxy,
+                weight=args.niche_output_separation_weight,
+                margin=args.niche_output_separation_margin,
+            )
+        )
+        curiosity_loss = CombinedCuriosityLoss(existing_losses)
+
     gan = components.GAN(
         G=g,
         D=d,
@@ -6629,6 +8971,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     )
     fixed_latent_bank_size = 0
     fixed_latent_uniformity_active = False
+    fixed_latent_niche_count = 0
+    fixed_latent_niche_labels_np = np.empty(0, dtype=np.int32)
+    fixed_latent_niche_stats: dict[str, float] = {}
     if args.fixed_latent_bank:
         if not isinstance(gan.latent_dim, int):
             raise ValueError("--fixed_latent_bank requires an integer latent_dim")
@@ -6637,6 +8982,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             if args.fixed_latent_bank_size is not None
             else buffer.B.buffer_size
         )
+        latent_cluster_labels: torch.Tensor | None = None
         if args.fixed_latent_selection == "output_diverse":
             latent_bank = select_output_diverse_latent_bank(
                 gan.G,
@@ -6649,6 +8995,27 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 uniform_high=args.latent_uniform_high,
                 device=device,
                 dtype=torch.float32,
+            )
+        elif args.fixed_latent_selection == "clustered_niches":
+            fixed_latent_niche_count = args.fixed_latent_niche_count or max(
+                args.niche_buffer_count, 2
+            )
+            (
+                latent_bank,
+                latent_cluster_labels,
+                fixed_latent_niche_stats,
+            ) = make_clustered_niche_latent_bank(
+                latent_dim=gan.latent_dim,
+                bank_size=fixed_latent_bank_size,
+                niche_count=fixed_latent_niche_count,
+                center_scale=args.fixed_latent_niche_center_scale,
+                within_std=args.fixed_latent_niche_within_std,
+                normalize_radius=not args.fixed_latent_niche_no_normalize_radius,
+                device=device,
+                dtype=torch.float32,
+            )
+            fixed_latent_niche_labels_np = (
+                latent_cluster_labels.detach().cpu().numpy().astype(np.int32)
             )
         elif args.fixed_latent_selection == "random":
             latent_bank = sample_latents(
@@ -6668,6 +9035,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             latent_bank,
             batch_size=args.batch_size,
             mode=args.fixed_latent_sample_mode,
+            cluster_labels=latent_cluster_labels,
             noise_std=args.fixed_latent_noise_std,
             normalize_noise_scale=not args.fixed_latent_noise_no_normalize,
         )
@@ -6687,11 +9055,19 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             )
             gan.curiosity_loss = CombinedCuriosityLoss(existing_losses)
             fixed_latent_uniformity_active = True
+        fixed_latent_niche_stats_text = " ".join(
+            f"{key}={value:.4g}" for key, value in fixed_latent_niche_stats.items()
+        )
         logger.info(
             "Using fixed latent bank: "
             f"size={fixed_latent_bank_size} selection={args.fixed_latent_selection} "
             f"candidate_multiplier={args.fixed_latent_candidate_multiplier} "
             f"sample_mode={args.fixed_latent_sample_mode} "
+            f"niche_count={fixed_latent_niche_count} "
+            f"niche_center_scale={args.fixed_latent_niche_center_scale} "
+            f"niche_within_std={args.fixed_latent_niche_within_std} "
+            f"niche_normalize_radius={not args.fixed_latent_niche_no_normalize_radius} "
+            f"{fixed_latent_niche_stats_text} "
             f"noise_std={args.fixed_latent_noise_std} "
             f"noise_normalize={not args.fixed_latent_noise_no_normalize} "
             f"uniformity_weight={args.fixed_latent_uniformity_weight} "
@@ -6701,6 +9077,71 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     elif args.fixed_latent_uniformity_weight > 0:
         raise ValueError(
             "--fixed_latent_uniformity_weight requires --fixed_latent_bank"
+        )
+
+    original_generator = gan.G
+    initial_replay_generator: InitialBufferReplayGenerator | None = None
+    initial_blob_labels_np = np.empty(0, dtype=np.int32)
+    initial_blob_stats: dict[str, float] = {}
+    if args.initial_buffer_mode == "random_blobs":
+        initial_fill_count = (
+            math.ceil(buffer.B.buffer_size / args.batch_size) * args.batch_size
+        )
+        cluster_niche_count = (
+            args.niche_buffer_count if args.initial_blob_cluster_niches else 1
+        )
+        seed_codes_np, seed_stats, initial_blob_labels_np = (
+            make_sorted_material_blob_seed_codes(
+                initial_fill_count,
+                nely=args.grid_height,
+                nelx=args.grid_width,
+                target_mean=args.volume_max,
+                seed=args.seed + 1009,
+                blob_count_min=args.initial_blob_count_min,
+                blob_count_max=args.initial_blob_count_max,
+                radius_min=args.initial_blob_radius_min,
+                radius_max=args.initial_blob_radius_max,
+                score_margin=args.initial_blob_score_margin,
+                score_noise=args.initial_blob_score_noise,
+                candidate_multiplier=args.initial_blob_candidate_multiplier,
+                min_hamming=args.initial_blob_min_hamming,
+                cluster_niche_count=cluster_niche_count,
+            )
+        )
+        initial_blob_stats = seed_stats
+        if args.initial_blob_cluster_niches:
+            if not hasattr(buffer.B, "queue_initial_niche_labels"):
+                raise RuntimeError(
+                    "--initial_blob_cluster_niches requires NicheEliteBuffer"
+                )
+            buffer.B.queue_initial_niche_labels(initial_blob_labels_np)
+        seed_codes = torch.from_numpy(seed_codes_np).to(
+            device=device, dtype=torch.float32
+        )
+        initial_replay_generator = InitialBufferReplayGenerator(
+            seed_codes,
+            fallback=original_generator,
+        ).to(device)
+        gan.G = initial_replay_generator
+        cluster_log = ""
+        if args.initial_blob_cluster_niches:
+            cluster_log = (
+                f" cluster_niches={cluster_niche_count} "
+                f"cluster_internal_mean={seed_stats.get('cluster_internal_mean_hamming', float('nan')):.4f} "
+                f"cluster_external_mean={seed_stats.get('cluster_external_mean_hamming', float('nan')):.4f} "
+                f"cluster_margin={seed_stats.get('cluster_separation_margin', float('nan')):.4f}"
+            )
+        logger.info(
+            "Using random blob initial buffer: "
+            f"count={initial_fill_count} blobs=[{args.initial_blob_count_min},"
+            f"{args.initial_blob_count_max}] radius=[{args.initial_blob_radius_min:g},"
+            f"{args.initial_blob_radius_max:g}] score_margin={args.initial_blob_score_margin:g} "
+            f"score_noise={args.initial_blob_score_noise:g} "
+            f"candidate_multiplier={args.initial_blob_candidate_multiplier} "
+            f"target_min_hamming={args.initial_blob_min_hamming:g} "
+            f"actual_min_hamming={seed_stats['min_pairwise_hamming']:.4f} "
+            f"actual_mean_hamming={seed_stats['mean_pairwise_hamming']:.4f}"
+            f"{cluster_log}"
         )
 
     opt_components = components.OptComponents(
@@ -6718,84 +9159,107 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         else None,
         gradient_penalty_weight=args.gradient_penalty_weight,
     )
-    if args.train_on_decoded:
-        if args.optimizer_type == "plackett_luce":
-            raise ValueError(
-                "--optimizer_type plackett_luce does not support --train_on_decoded yet"
+    try:
+        if args.train_on_decoded:
+            if args.optimizer_type == "plackett_luce":
+                raise ValueError(
+                    "--optimizer_type plackett_luce does not support --train_on_decoded yet"
+                )
+            optimizer = make_decoded_density_optimizer(
+                args.optimizer_type,
+                opt_components,
+                evaluator=evaluator,
+                objective=objective,
             )
-        optimizer = make_decoded_density_optimizer(
-            args.optimizer_type,
-            opt_components,
-            evaluator=evaluator,
-        )
-    else:
-        optimizer = make_optimizer(
-            args.optimizer_type,
-            opt_components,
-            archive_size=args.ranker_archive_size,
-            ranker_list_size=args.ranker_list_size,
-            ranker_steps=args.ranker_steps,
-            ranker_generator_elite_margin=args.ranker_generator_elite_margin,
-            ranker_weight=args.ranker_weight,
-            ranker_target_curve=args.ranker_target_curve,
-            ranker_tau=args.ranker_tau,
-            ranker_sample_pool_size=args.ranker_sample_pool_size,
-            ranker_sample_mode=args.ranker_sample_mode,
-            ranker_target_scope=args.ranker_target_scope,
-            ranker_list_repeats=args.ranker_list_repeats,
-            ranker_fake_weight=args.ranker_fake_weight,
-            ranker_fake_repeats=args.ranker_fake_repeats,
-            d_score_center_weight=args.d_score_center_weight,
-            d_score_scale_weight=args.d_score_scale_weight,
-            d_score_target_std=args.d_score_target_std,
-            utility_target_scale=args.utility_target_scale,
-            utility_loss=args.utility_loss,
-            utility_weight=args.utility_weight,
-            generator_utility_weight=args.generator_utility_weight,
-            utility_clip=args.utility_clip,
-            proposal_pool_size=args.proposal_pool_size,
-            proposal_top_k=args.proposal_top_k,
-            proposal_diversity_min_hamming=args.proposal_diversity_min_hamming,
-            proposal_diversity_topk_frac=args.proposal_diversity_topk_frac,
-            proposal_buffer_novelty_min_hamming=args.proposal_buffer_novelty_min_hamming,
-            proposal_buffer_novelty_reference_size=args.proposal_buffer_novelty_reference_size,
-            proposal_buffer_reject_exact_design_duplicates=args.proposal_buffer_reject_exact_design_duplicates,
-            design_proxy=proposal_design_proxy,
-            proposal_evolution_fraction=args.proposal_evolution_fraction,
-            proposal_evolution_parent_source=args.proposal_evolution_parent_source,
-            proposal_evolution_crossover=args.proposal_evolution_crossover,
-            proposal_evolution_mutation_rate=args.proposal_evolution_mutation_rate,
-            proposal_evolution_mutation_scale=args.proposal_evolution_mutation_scale,
-            proposal_evolution_grid_height=code_height
-            if f_dim == code_height * code_width
-            else None,
-            proposal_evolution_grid_width=code_width
-            if f_dim == code_height * code_width
-            else None,
-            proposal_gradient_steps=args.proposal_gradient_steps,
-            proposal_gradient_step_size=args.proposal_gradient_step_size,
-            proposal_gradient_mode=args.proposal_gradient_mode,
-            proposal_gradient_normalize=not args.proposal_gradient_no_normalize,
-            proposal_gradient_noise=args.proposal_gradient_noise,
-            proposal_gradient_keep_original=args.proposal_gradient_keep_original,
-            ga_offspring_fraction=args.ga_offspring_fraction,
-            ga_pool_size=args.ga_pool_size,
-            ga_parent_pool_size=args.ga_parent_pool_size,
-            ga_mutation_rate=args.ga_mutation_rate,
-            ga_mutation_scale=args.ga_mutation_scale,
-            generator_elite_context_size=args.set_generator_elite_context_size,
-            generator_elite_context_pool_size=args.set_generator_elite_context_pool_size,
+        else:
+            optimizer = make_optimizer(
+                args.optimizer_type,
+                opt_components,
+                archive_size=args.ranker_archive_size,
+                ranker_list_size=args.ranker_list_size,
+                ranker_steps=args.ranker_steps,
+                ranker_generator_elite_margin=args.ranker_generator_elite_margin,
+                ranker_weight=args.ranker_weight,
+                ranker_target_curve=args.ranker_target_curve,
+                ranker_tau=args.ranker_tau,
+                ranker_sample_pool_size=args.ranker_sample_pool_size,
+                ranker_sample_mode=args.ranker_sample_mode,
+                ranker_target_scope=args.ranker_target_scope,
+                ranker_niche_local_targets=args.ranker_niche_local_targets,
+                ranker_list_repeats=args.ranker_list_repeats,
+                ranker_fake_weight=args.ranker_fake_weight,
+                ranker_fake_repeats=args.ranker_fake_repeats,
+                d_score_center_weight=args.d_score_center_weight,
+                d_score_scale_weight=args.d_score_scale_weight,
+                d_score_target_std=args.d_score_target_std,
+                utility_target_scale=args.utility_target_scale,
+                utility_loss=args.utility_loss,
+                utility_weight=args.utility_weight,
+                generator_utility_weight=args.generator_utility_weight,
+                utility_clip=args.utility_clip,
+                proposal_pool_size=args.proposal_pool_size,
+                proposal_top_k=args.proposal_top_k,
+                proposal_diversity_min_hamming=args.proposal_diversity_min_hamming,
+                proposal_diversity_topk_frac=args.proposal_diversity_topk_frac,
+                proposal_buffer_novelty_min_hamming=args.proposal_buffer_novelty_min_hamming,
+                proposal_buffer_novelty_reference_size=args.proposal_buffer_novelty_reference_size,
+                proposal_buffer_reject_exact_design_duplicates=args.proposal_buffer_reject_exact_design_duplicates,
+                design_proxy=proposal_design_proxy,
+                proposal_evolution_fraction=args.proposal_evolution_fraction,
+                proposal_evolution_parent_source=args.proposal_evolution_parent_source,
+                proposal_evolution_crossover=args.proposal_evolution_crossover,
+                proposal_evolution_mutation_rate=args.proposal_evolution_mutation_rate,
+                proposal_evolution_mutation_scale=args.proposal_evolution_mutation_scale,
+                proposal_evolution_grid_height=code_height
+                if f_dim == code_height * code_width
+                else None,
+                proposal_evolution_grid_width=code_width
+                if f_dim == code_height * code_width
+                else None,
+                proposal_gradient_steps=args.proposal_gradient_steps,
+                proposal_gradient_step_size=args.proposal_gradient_step_size,
+                proposal_gradient_mode=args.proposal_gradient_mode,
+                proposal_gradient_normalize=not args.proposal_gradient_no_normalize,
+                proposal_gradient_noise=args.proposal_gradient_noise,
+                proposal_gradient_keep_original=args.proposal_gradient_keep_original,
+                ga_offspring_fraction=args.ga_offspring_fraction,
+                ga_pool_size=args.ga_pool_size,
+                ga_parent_pool_size=args.ga_parent_pool_size,
+                ga_mutation_rate=args.ga_mutation_rate,
+                ga_mutation_scale=args.ga_mutation_scale,
+                generator_elite_context_size=args.set_generator_elite_context_size,
+                generator_elite_context_pool_size=args.set_generator_elite_context_pool_size,
+            )
+    finally:
+        if initial_replay_generator is not None:
+            gan.G = original_generator
+
+    density_filter_schedule_active = (
+        args.density_filter_warmup_iters > 0
+        and args.density_filter_warmup_iters < args.n_iter
+        and args.density_filter_final_radius != args.density_filter_radius
+    )
+    density_filter_switched = False
+    density_filter_extra_eval_count = 0
+    if args.density_filter_warmup_iters > 0:
+        logger.info(
+            "Density filter schedule: "
+            f"warmup_radius={args.density_filter_radius} "
+            f"warmup_iters={args.density_filter_warmup_iters} "
+            f"final_radius={args.density_filter_final_radius} "
+            f"will_switch={density_filter_schedule_active}"
         )
 
     logger.info(
         f"FEMCantilever: preset={args.preset} grid={args.grid_width}x{args.grid_height} domain={args.domain_width:g}x{args.domain_height:g} code_grid={code_width}x{code_height} backend={args.backend} encoding={args.encoding} optimizer={args.optimizer_type} n_iter={args.n_iter} "
         f"latent_distribution={args.latent_distribution} latent_uniform=[{args.latent_uniform_low:g},{args.latent_uniform_high:g}] "
+        f"initial_buffer_mode={args.initial_buffer_mode} initial_blob_count=[{args.initial_blob_count_min},{args.initial_blob_count_max}] initial_blob_radius=[{args.initial_blob_radius_min:g},{args.initial_blob_radius_max:g}] initial_blob_score_margin={args.initial_blob_score_margin:g} initial_blob_score_noise={args.initial_blob_score_noise:g} initial_blob_candidate_multiplier={args.initial_blob_candidate_multiplier} initial_blob_min_hamming={args.initial_blob_min_hamming:g} "
         f"G={args.generator_type} G_norm={args.generator_output_norm} D={args.discriminator_type} "
         f"D_spectral_norm={args.discriminator_spectral_norm} D_activation={args.discriminator_activation} "
-        f"fixed_latent_bank={args.fixed_latent_bank} fixed_latent_bank_size={fixed_latent_bank_size} fixed_latent_selection={args.fixed_latent_selection} fixed_latent_sample_mode={args.fixed_latent_sample_mode} fixed_latent_noise_std={args.fixed_latent_noise_std} fixed_latent_noise_normalize={not args.fixed_latent_noise_no_normalize} fixed_latent_uniformity_active={fixed_latent_uniformity_active} fixed_latent_uniformity_weight={args.fixed_latent_uniformity_weight} fixed_latent_uniformity_batch_size={args.fixed_latent_uniformity_batch_size} "
+        f"fixed_latent_bank={args.fixed_latent_bank} fixed_latent_bank_size={fixed_latent_bank_size} fixed_latent_selection={args.fixed_latent_selection} fixed_latent_sample_mode={args.fixed_latent_sample_mode} fixed_latent_niche_count={fixed_latent_niche_count} fixed_latent_niche_center_scale={args.fixed_latent_niche_center_scale} fixed_latent_niche_within_std={args.fixed_latent_niche_within_std} fixed_latent_niche_normalize_radius={not args.fixed_latent_niche_no_normalize_radius} fixed_latent_noise_std={args.fixed_latent_noise_std} fixed_latent_noise_normalize={not args.fixed_latent_noise_no_normalize} fixed_latent_uniformity_active={fixed_latent_uniformity_active} fixed_latent_uniformity_weight={args.fixed_latent_uniformity_weight} fixed_latent_uniformity_batch_size={args.fixed_latent_uniformity_batch_size} "
         f"setG_dim={args.set_generator_dim} setG_depth={args.set_generator_depth} setG_heads={args.set_generator_heads} setG_elite_context={args.set_generator_elite_context_size} setG_elite_pool={args.set_generator_elite_context_pool_size} "
         f"setD_dim={args.set_discriminator_dim} setD_depth={args.set_discriminator_depth} setD_heads={args.set_discriminator_heads} "
-        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_reference={args.curiosity_reference} curiosity_schedule={args.curiosity_schedule} curiosity_cycles={args.curiosity_cycles} curiosity_decay={args.curiosity_decay} plummer_power={args.plummer_power} plummer_eps={args.plummer_eps} plummer_normalize={args.plummer_normalize} plummer_terms={args.plummer_terms} g_uniformity_warmup_steps={args.g_uniformity_warmup_steps} g_uniformity_warmup_batch_size={warmup_batch_size} g_uniformity_warmup_weight={warmup_weight} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} buffer_diversity_min_hamming={args.buffer_diversity_min_hamming} buffer_diversity_topk_frac={args.buffer_diversity_topk_frac} elite_sampling={args.elite_sampling} elite_pool_size={args.elite_pool_size} ranker_list_size={args.ranker_list_size} ranker_steps={args.ranker_steps} ranker_weight={args.ranker_weight} ranker_target_curve={args.ranker_target_curve} ranker_tau={args.ranker_tau} ranker_target_scope={args.ranker_target_scope} ranker_list_repeats={args.ranker_list_repeats} ranker_fake_weight={args.ranker_fake_weight} ranker_fake_repeats={args.ranker_fake_repeats} ranker_sample_pool_size={args.ranker_sample_pool_size} ranker_sample_mode={args.ranker_sample_mode} d_score_center_weight={args.d_score_center_weight} d_score_scale_weight={args.d_score_scale_weight} d_score_target_std={args.d_score_target_std} utility_target_scale={args.utility_target_scale} utility_loss={args.utility_loss} utility_weight={args.utility_weight} generator_utility_weight={args.generator_utility_weight} utility_clip={args.utility_clip} proposal_pool_size={args.proposal_pool_size} proposal_top_k={args.proposal_top_k} proposal_diversity_min_hamming={args.proposal_diversity_min_hamming} proposal_buffer_novelty_min_hamming={args.proposal_buffer_novelty_min_hamming} proposal_buffer_novelty_reference_size={args.proposal_buffer_novelty_reference_size} proposal_buffer_reject_exact_design_duplicates={args.proposal_buffer_reject_exact_design_duplicates} proposal_buffer_novelty_threshold={args.proposal_buffer_novelty_threshold} proposal_evolution_fraction={args.proposal_evolution_fraction} proposal_evolution_parent_source={args.proposal_evolution_parent_source} proposal_evolution_crossover={args.proposal_evolution_crossover} proposal_evolution_mutation_rate={args.proposal_evolution_mutation_rate} proposal_evolution_mutation_scale={args.proposal_evolution_mutation_scale} proposal_gradient_steps={args.proposal_gradient_steps} proposal_gradient_step_size={args.proposal_gradient_step_size} proposal_gradient_mode={args.proposal_gradient_mode} proposal_gradient_normalize={not args.proposal_gradient_no_normalize} proposal_gradient_noise={args.proposal_gradient_noise} proposal_gradient_keep_original={args.proposal_gradient_keep_original} ga_offspring_fraction={args.ga_offspring_fraction} ga_pool_size={args.ga_pool_size} ga_parent_pool_size={args.ga_parent_pool_size} ga_mutation_rate={args.ga_mutation_rate} ga_mutation_scale={args.ga_mutation_scale} load_case={args.load_case} robust_load_cases={args.robust_load_cases} robust_load_aggregate={args.robust_load_aggregate} robust_load_cvar_frac={args.robust_load_cvar_frac} removal_ladder_volumes={args.removal_ladder_volumes} removal_ladder_compliances={args.removal_ladder_compliances} removal_ladder_connectivity_max={args.removal_ladder_connectivity_max} load_scale={args.load_scale} fem_workers={args.fem_workers} filter_radius={args.density_filter_radius} residual_scale={args.residual_scale} "
+        f"curiosity={args.curiosity} curiosity_space={args.curiosity_space} curiosity_reference={args.curiosity_reference} curiosity_schedule={args.curiosity_schedule} curiosity_cycles={args.curiosity_cycles} curiosity_decay={args.curiosity_decay} plummer_power={args.plummer_power} plummer_eps={args.plummer_eps} plummer_normalize={args.plummer_normalize} plummer_terms={args.plummer_terms} g_uniformity_warmup_steps={args.g_uniformity_warmup_steps} g_uniformity_warmup_batch_size={warmup_batch_size} g_uniformity_warmup_weight={warmup_weight} g_opt={args.g_torch_optimizer} d_opt={args.d_torch_optimizer} g_lr={args.g_lr} d_lr={args.d_lr} buffer_diversity_min_hamming={args.buffer_diversity_min_hamming} buffer_diversity_topk_frac={args.buffer_diversity_topk_frac} niche_buffer_count={args.niche_buffer_count} niche_buffer_min_hamming={args.niche_buffer_min_hamming} niche_buffer_view_mode={args.niche_buffer_view_mode} niche_buffer_cross_min_hamming={args.niche_buffer_cross_min_hamming} niche_buffer_cross_reference_top_k={args.niche_buffer_cross_reference_top_k} niche_output_separation_weight={args.niche_output_separation_weight} niche_output_separation_margin={args.niche_output_separation_margin} elite_sampling={args.elite_sampling} elite_pool_size={args.elite_pool_size} ranker_list_size={args.ranker_list_size} ranker_steps={args.ranker_steps} ranker_weight={args.ranker_weight} ranker_target_curve={args.ranker_target_curve} ranker_tau={args.ranker_tau} ranker_target_scope={args.ranker_target_scope} ranker_niche_local_targets={args.ranker_niche_local_targets} ranker_list_repeats={args.ranker_list_repeats} ranker_fake_weight={args.ranker_fake_weight} ranker_fake_repeats={args.ranker_fake_repeats} ranker_sample_pool_size={args.ranker_sample_pool_size} ranker_sample_mode={args.ranker_sample_mode} d_score_center_weight={args.d_score_center_weight} d_score_scale_weight={args.d_score_scale_weight} d_score_target_std={args.d_score_target_std} utility_target_scale={args.utility_target_scale} utility_loss={args.utility_loss} utility_weight={args.utility_weight} generator_utility_weight={args.generator_utility_weight} utility_clip={args.utility_clip} proposal_pool_size={args.proposal_pool_size} proposal_top_k={args.proposal_top_k} proposal_diversity_min_hamming={args.proposal_diversity_min_hamming} proposal_buffer_novelty_min_hamming={args.proposal_buffer_novelty_min_hamming} proposal_buffer_novelty_reference_size={args.proposal_buffer_novelty_reference_size} proposal_buffer_reject_exact_design_duplicates={args.proposal_buffer_reject_exact_design_duplicates} proposal_buffer_novelty_threshold={args.proposal_buffer_novelty_threshold} proposal_evolution_fraction={args.proposal_evolution_fraction} proposal_evolution_parent_source={args.proposal_evolution_parent_source} proposal_evolution_crossover={args.proposal_evolution_crossover} proposal_evolution_mutation_rate={args.proposal_evolution_mutation_rate} proposal_evolution_mutation_scale={args.proposal_evolution_mutation_scale} proposal_gradient_steps={args.proposal_gradient_steps} proposal_gradient_step_size={args.proposal_gradient_step_size} proposal_gradient_mode={args.proposal_gradient_mode} proposal_gradient_normalize={not args.proposal_gradient_no_normalize} proposal_gradient_noise={args.proposal_gradient_noise} proposal_gradient_keep_original={args.proposal_gradient_keep_original} ga_offspring_fraction={args.ga_offspring_fraction} ga_pool_size={args.ga_pool_size} ga_parent_pool_size={args.ga_parent_pool_size} ga_mutation_rate={args.ga_mutation_rate} ga_mutation_scale={args.ga_mutation_scale} load_case={args.load_case} robust_load_cases={args.robust_load_cases} robust_load_aggregate={args.robust_load_aggregate} robust_load_cvar_frac={args.robust_load_cvar_frac} removal_ladder_volumes={args.removal_ladder_volumes} removal_ladder_compliances={args.removal_ladder_compliances} removal_ladder_connectivity_max={args.removal_ladder_connectivity_max} load_scale={args.load_scale} fem_workers={args.fem_workers} compliance_solver={args.compliance_solver} matrix_free_cg_max_iter={args.matrix_free_cg_max_iter} matrix_free_cg_tol={args.matrix_free_cg_tol} matrix_free_cg_device={args.matrix_free_cg_device} matrix_free_cg_dtype={args.matrix_free_cg_dtype} filter_radius={args.density_filter_radius} filter_warmup_iters={args.density_filter_warmup_iters} filter_final_radius={args.density_filter_final_radius} residual_scale={args.residual_scale} "
         f"projection_beta={args.projection_beta} hard_binarize={args.hard_binarize} binhead_connect_support={args.binhead_connect_support} train_on_decoded={args.train_on_decoded}"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -6812,6 +9276,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     )
     history = [
         record_buffer_history(
+            buffer.B,
+            iteration=0,
+            eval_count=init_eval_count,
+        )
+    ]
+    niche_history: list[np.ndarray] = [
+        record_niche_history(
             buffer.B,
             iteration=0,
             eval_count=init_eval_count,
@@ -6877,6 +9348,58 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         design_history_iterations.append(float(iteration))
         design_history_eval_counts.append(float(eval_count))
 
+    def switch_density_filter_if_due(iteration: int) -> None:
+        nonlocal density_filter_switched, density_filter_extra_eval_count
+        if (
+            not density_filter_schedule_active
+            or density_filter_switched
+            or iteration <= args.density_filter_warmup_iters
+        ):
+            return
+
+        previous_radius = evaluator.config.density_filter_radius
+        evaluator.set_density_filter_radius(args.density_filter_final_radius)
+        reeval_count = reevaluate_buffer_entries(
+            buffer.B,
+            fn.f,
+            device=fn.device,
+            dtype=fn.dtype,
+            batch_size=args.batch_size,
+        )
+        density_filter_extra_eval_count += reeval_count
+        density_filter_switched = True
+        switch_iteration = iteration - 1
+        switch_eval_count = (
+            init_eval_count
+            + switch_iteration * args.batch_size
+            + density_filter_extra_eval_count
+        )
+        logger.info(
+            "Switched density filter radius "
+            f"from {previous_radius} to {args.density_filter_final_radius} "
+            f"after iteration={switch_iteration}; "
+            f"re_evaluated_buffer_entries={reeval_count} "
+            f"eval_count={switch_eval_count}"
+        )
+        history_row = record_buffer_history(
+            buffer.B,
+            iteration=switch_iteration,
+            eval_count=switch_eval_count,
+        )
+        history.append(history_row)
+        niche_history.append(
+            record_niche_history(
+                buffer.B,
+                iteration=switch_iteration,
+                eval_count=switch_eval_count,
+            )
+        )
+        write_live_progress(history_row)
+        record_design_history_checkpoint(
+            iteration=switch_iteration,
+            eval_count=switch_eval_count,
+        )
+
     write_live_progress(history[-1])
     record_design_history_checkpoint(iteration=0, eval_count=init_eval_count)
     progress = Progress(
@@ -6894,8 +9417,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             mean=buffer.B.get_mean_buffer_value(level=-1),
         )
         for iteration in range(1, args.n_iter + 1):
+            switch_density_filter_if_due(iteration)
             optimizer.step()
-            eval_count = init_eval_count + iteration * args.batch_size
+            eval_count = (
+                init_eval_count
+                + iteration * args.batch_size
+                + density_filter_extra_eval_count
+            )
             if iteration % args.history_interval == 0 or iteration == args.n_iter:
                 history_row = record_buffer_history(
                     buffer.B,
@@ -6903,6 +9431,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                     eval_count=eval_count,
                 )
                 history.append(history_row)
+                niche_history.append(
+                    record_niche_history(
+                        buffer.B,
+                        iteration=iteration,
+                        eval_count=eval_count,
+                    )
+                )
                 write_live_progress(history_row)
                 record_design_history_checkpoint(
                     iteration=iteration,
@@ -6948,8 +9483,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     if levels_ladder_rungs:
         raw_top_values = []
         for sample in top_designs_np:
-            volume, roughness, _connectivity, compliance = evaluator.density_objectives(
-                sample
+            volume, roughness, _connectivity, _diversity, compliance = (
+                evaluator.density_objectives(sample)
             )
             raw_top_values.append(
                 [
@@ -6963,8 +9498,61 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     metrics = compliance_summary(summary_values)
     actual_compliance = top_values[:, -1].copy()
     relative_compliance = actual_compliance / evaluator.solid_compliance
+    per_niche_top_k = 6
+    per_niche_top_designs = np.empty(
+        (0, 0, args.grid_height, args.grid_width),
+        dtype=np.float32,
+    )
+    per_niche_top_values = np.empty((0, 0, top_values.shape[1]), dtype=np.float32)
+    if hasattr(buffer.B, "get_niche_top_k") and hasattr(
+        buffer.B,
+        "get_niche_sorted_values",
+    ):
+        niche_count = int(buffer.B.niche_count)
+        value_dim = int(transformed_archive_values.shape[1])
+        per_niche_top_designs = np.full(
+            (niche_count, per_niche_top_k, args.grid_height, args.grid_width),
+            np.nan,
+            dtype=np.float32,
+        )
+        per_niche_top_values = np.full(
+            (niche_count, per_niche_top_k, value_dim),
+            np.nan,
+            dtype=np.float32,
+        )
+        for niche_idx in range(niche_count):
+            niche_tensors = buffer.B.get_niche_top_k(niche_idx, per_niche_top_k)
+            niche_k = int(niche_tensors.shape[0])
+            if niche_k == 0:
+                continue
+            if args.train_on_decoded:
+                niche_designs = (
+                    niche_tensors.reshape(
+                        niche_k,
+                        args.grid_height,
+                        args.grid_width,
+                    )
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                niche_designs = evaluator.decode_designs_numpy(
+                    niche_tensors.detach().cpu().numpy()
+                )
+            niche_values = np.asarray(
+                buffer.B.get_niche_sorted_values(niche_idx)[:niche_k],
+                dtype=np.float32,
+            )
+            per_niche_top_designs[niche_idx, :niche_k] = niche_designs
+            per_niche_top_values[niche_idx, :niche_k] = niche_values
 
     history_scalar_array, history_best_values, history_columns = history_arrays(history)
+    niche_history_array = (
+        np.concatenate([row for row in niche_history if row.size], axis=0)
+        if any(row.size for row in niche_history)
+        else np.empty((0, len(NICHE_HISTORY_COLUMNS)), dtype=np.float32)
+    )
     if design_history:
         design_history_array = np.stack(design_history, axis=0).astype(np.float32)
         design_history_values_array = np.stack(design_history_values, axis=0).astype(
@@ -6992,6 +9580,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     history_plot_path = args.output_dir / f"buffer_history_{suffix}.png"
     best_design_history_plot_path = (
         args.output_dir / f"best_design_history_{suffix}.png"
+    )
+    per_niche_top_designs_plot_path = (
+        args.output_dir / f"top_designs_by_niche_{suffix}.png"
     )
     if not args.no_history_plot:
         plot_buffer_history(
@@ -7023,12 +9614,24 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             f"FEM Cantilever Top Designs (curiosity={args.curiosity:g}, seed={args.seed})"
         ),
     )
+    save_per_niche_design_grid(
+        per_niche_top_designs,
+        per_niche_top_values,
+        per_niche_top_designs_plot_path,
+        title=(
+            f"FEM Cantilever Top Designs By Niche "
+            f"(curiosity={args.curiosity:g}, seed={args.seed})"
+        ),
+    )
     mean_l2 = pairwise_l2_mean(top_designs)
     mean_hamming = pairwise_hamming_mean(top_designs)
 
     np.savez_compressed(
         args.output_dir / f"top_designs_{suffix}.npz",
         designs=top_designs.cpu().numpy(),
+        per_niche_top_designs=per_niche_top_designs,
+        per_niche_top_values=per_niche_top_values,
+        per_niche_top_designs_plot=np.asarray([str(per_niche_top_designs_plot_path)]),
         archive_tensors=top_archive_tensors.cpu().numpy(),
         raw_design_code=raw_design_code,
         values=top_values,
@@ -7037,6 +9640,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         history=history_scalar_array,
         history_columns=history_columns,
         history_best_values=history_best_values,
+        niche_history=niche_history_array,
+        niche_history_columns=NICHE_HISTORY_COLUMNS,
         history_plot=np.asarray(
             ["" if args.no_history_plot else str(history_plot_path)]
         ),
@@ -7130,6 +9735,55 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         sorted_material_steepness=np.asarray(
             [args.sorted_material_steepness], dtype=np.float32
         ),
+        initial_buffer_mode=np.asarray([args.initial_buffer_mode]),
+        initial_blob_count_min=np.asarray(
+            [args.initial_blob_count_min], dtype=np.int32
+        ),
+        initial_blob_count_max=np.asarray(
+            [args.initial_blob_count_max], dtype=np.int32
+        ),
+        initial_blob_radius_min=np.asarray(
+            [args.initial_blob_radius_min], dtype=np.float32
+        ),
+        initial_blob_radius_max=np.asarray(
+            [args.initial_blob_radius_max], dtype=np.float32
+        ),
+        initial_blob_score_margin=np.asarray(
+            [args.initial_blob_score_margin], dtype=np.float32
+        ),
+        initial_blob_score_noise=np.asarray(
+            [args.initial_blob_score_noise], dtype=np.float32
+        ),
+        initial_blob_candidate_multiplier=np.asarray(
+            [args.initial_blob_candidate_multiplier], dtype=np.int32
+        ),
+        initial_blob_min_hamming=np.asarray(
+            [args.initial_blob_min_hamming], dtype=np.float32
+        ),
+        initial_blob_cluster_niches=np.asarray(
+            [args.initial_blob_cluster_niches], dtype=np.int32
+        ),
+        initial_blob_niche_labels=initial_blob_labels_np.astype(np.int32, copy=False),
+        initial_blob_cluster_niche_count=np.asarray(
+            [initial_blob_stats.get("cluster_niche_count", 0.0)],
+            dtype=np.float32,
+        ),
+        initial_blob_cluster_internal_mean_hamming=np.asarray(
+            [initial_blob_stats.get("cluster_internal_mean_hamming", float("nan"))],
+            dtype=np.float32,
+        ),
+        initial_blob_cluster_external_mean_hamming=np.asarray(
+            [initial_blob_stats.get("cluster_external_mean_hamming", float("nan"))],
+            dtype=np.float32,
+        ),
+        initial_blob_cluster_separation_margin=np.asarray(
+            [initial_blob_stats.get("cluster_separation_margin", float("nan"))],
+            dtype=np.float32,
+        ),
+        initial_blob_cluster_medoid_min_hamming=np.asarray(
+            [initial_blob_stats.get("cluster_medoid_min_hamming", float("nan"))],
+            dtype=np.float32,
+        ),
         bar_count=np.asarray([args.bar_count], dtype=np.int32),
         bar_width_min=np.asarray([args.bar_width_min], dtype=np.float32),
         bar_width_max=np.asarray([args.bar_width_max], dtype=np.float32),
@@ -7146,6 +9800,41 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             [args.fixed_latent_candidate_multiplier], dtype=np.int32
         ),
         fixed_latent_sample_mode=np.asarray([args.fixed_latent_sample_mode]),
+        fixed_latent_niche_count=np.asarray([fixed_latent_niche_count], dtype=np.int32),
+        fixed_latent_niche_center_scale=np.asarray(
+            [args.fixed_latent_niche_center_scale], dtype=np.float32
+        ),
+        fixed_latent_niche_within_std=np.asarray(
+            [args.fixed_latent_niche_within_std], dtype=np.float32
+        ),
+        fixed_latent_niche_normalize_radius=np.asarray(
+            [not args.fixed_latent_niche_no_normalize_radius], dtype=np.int32
+        ),
+        fixed_latent_niche_labels=fixed_latent_niche_labels_np,
+        fixed_latent_niche_within_mean_l2=np.asarray(
+            [fixed_latent_niche_stats.get("latent_niche_within_mean_l2", np.nan)],
+            dtype=np.float32,
+        ),
+        fixed_latent_niche_within_max_l2=np.asarray(
+            [fixed_latent_niche_stats.get("latent_niche_within_max_l2", np.nan)],
+            dtype=np.float32,
+        ),
+        fixed_latent_niche_between_mean_l2=np.asarray(
+            [fixed_latent_niche_stats.get("latent_niche_between_mean_l2", np.nan)],
+            dtype=np.float32,
+        ),
+        fixed_latent_niche_between_min_l2=np.asarray(
+            [fixed_latent_niche_stats.get("latent_niche_between_min_l2", np.nan)],
+            dtype=np.float32,
+        ),
+        fixed_latent_niche_center_mean_l2=np.asarray(
+            [fixed_latent_niche_stats.get("latent_niche_center_mean_l2", np.nan)],
+            dtype=np.float32,
+        ),
+        fixed_latent_niche_separation_margin_l2=np.asarray(
+            [fixed_latent_niche_stats.get("latent_niche_separation_margin_l2", np.nan)],
+            dtype=np.float32,
+        ),
         fixed_latent_noise_std=np.asarray(
             [args.fixed_latent_noise_std], dtype=np.float32
         ),
@@ -7223,6 +9912,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         ranker_target_curve=np.asarray([args.ranker_target_curve]),
         ranker_tau=np.asarray([args.ranker_tau], dtype=np.float32),
         ranker_target_scope=np.asarray([args.ranker_target_scope]),
+        ranker_niche_local_targets=np.asarray(
+            [args.ranker_niche_local_targets], dtype=np.int32
+        ),
         ranker_list_repeats=np.asarray([args.ranker_list_repeats], dtype=np.int32),
         ranker_fake_weight=np.asarray([args.ranker_fake_weight], dtype=np.float32),
         ranker_fake_repeats=np.asarray([args.ranker_fake_repeats], dtype=np.int32),
@@ -7319,7 +10011,37 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         buffer_diversity_topk_frac=np.asarray(
             [args.buffer_diversity_topk_frac], dtype=np.float32
         ),
+        niche_buffer_count=np.asarray([args.niche_buffer_count], dtype=np.int32),
+        niche_buffer_min_hamming=np.asarray(
+            [args.niche_buffer_min_hamming], dtype=np.float32
+        ),
+        niche_buffer_view_mode=np.asarray([args.niche_buffer_view_mode]),
+        niche_buffer_cross_min_hamming=np.asarray(
+            [args.niche_buffer_cross_min_hamming], dtype=np.float32
+        ),
+        niche_buffer_cross_reference_top_k=np.asarray(
+            [args.niche_buffer_cross_reference_top_k], dtype=np.int32
+        ),
+        niche_output_separation_weight=np.asarray(
+            [args.niche_output_separation_weight], dtype=np.float32
+        ),
+        niche_output_separation_margin=np.asarray(
+            [args.niche_output_separation_margin], dtype=np.float32
+        ),
         density_filter_radius=np.asarray([args.density_filter_radius], dtype=np.int32),
+        density_filter_warmup_iters=np.asarray(
+            [args.density_filter_warmup_iters], dtype=np.int32
+        ),
+        density_filter_final_radius=np.asarray(
+            [args.density_filter_final_radius], dtype=np.int32
+        ),
+        density_filter_active_radius=np.asarray(
+            [evaluator.config.density_filter_radius], dtype=np.int32
+        ),
+        density_filter_switched=np.asarray([density_filter_switched], dtype=np.int32),
+        density_filter_extra_eval_count=np.asarray(
+            [density_filter_extra_eval_count], dtype=np.int32
+        ),
         projection_beta=np.asarray([args.projection_beta], dtype=np.float32),
         projection_eta=np.asarray([args.projection_eta], dtype=np.float32),
         binhead_connect_support=np.asarray(
@@ -7329,6 +10051,15 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         compliance_ladder=np.asarray(args.compliance_ladder, dtype=np.float32),
         roughness_ladder=np.asarray(args.roughness_ladder, dtype=np.float32),
         connectivity_ladder=np.asarray(args.connectivity_ladder, dtype=np.float32),
+        diversity_ladder=np.asarray(args.diversity_ladder, dtype=np.float32),
+        diversity_reference_size=np.asarray(
+            [args.diversity_reference_size],
+            dtype=np.int32,
+        ),
+        diversity_chamfer_max_points=np.asarray(
+            [args.diversity_chamfer_max_points],
+            dtype=np.int32,
+        ),
         removal_ladder_volumes=np.asarray(
             args.removal_ladder_volumes,
             dtype=np.float32,
@@ -7367,6 +10098,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         ),
         load_scale=np.asarray([args.load_scale], dtype=np.float32),
         fem_workers=np.asarray([args.fem_workers], dtype=np.int32),
+        compliance_solver=np.asarray([args.compliance_solver]),
+        matrix_free_cg_max_iter=np.asarray(
+            [args.matrix_free_cg_max_iter],
+            dtype=np.int32,
+        ),
+        matrix_free_cg_tol=np.asarray([args.matrix_free_cg_tol], dtype=np.float32),
+        matrix_free_cg_device=np.asarray([args.matrix_free_cg_device]),
+        matrix_free_cg_dtype=np.asarray([args.matrix_free_cg_dtype]),
         e_max=np.asarray([args.e_max], dtype=np.float32),
         e_min=np.asarray([args.e_min], dtype=np.float32),
         poisson_ratio=np.asarray([args.poisson_ratio], dtype=np.float32),
